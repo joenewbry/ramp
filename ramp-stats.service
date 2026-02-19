@@ -1,0 +1,17 @@
+[Unit]
+Description=Ramp Stats Collector
+After=network.target
+
+[Service]
+Type=simple
+User=prometheus
+WorkingDirectory=/ssd/ramp
+ExecStart=/ssd/ramp/.venv/bin/python stats_collector.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/ssd/logs/ramp-stats.log
+StandardError=append:/ssd/logs/ramp-stats.log
+
+[Install]
+WantedBy=multi-user.target

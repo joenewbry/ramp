@@ -1,0 +1,11 @@
+[Unit]
+Description=Ramp Auto-Deploy (check for git updates on main)
+After=network.target
+
+[Service]
+Type=oneshot
+User=prometheus
+WorkingDirectory=/ssd/ramp
+ExecStart=/ssd/ramp/ramp-autodeploy.sh
+StandardOutput=append:/ssd/logs/ramp-autodeploy.log
+StandardError=append:/ssd/logs/ramp-autodeploy.log
