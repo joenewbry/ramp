@@ -246,7 +246,7 @@ def collect() -> dict:
     ts = int(time.time())
 
     # CPU
-    cpu_pct = psutil.cpu_percent(interval=1)
+    cpu_pct = psutil.cpu_percent(interval=0)
 
     # RAM
     mem = psutil.virtual_memory()
