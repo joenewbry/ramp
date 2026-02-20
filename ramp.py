@@ -442,7 +442,8 @@ def fetch_compute_stats() -> dict:
                 devices.append({"id": dev["id"], "label": dev["label"],
                                  "color": dev["color"], "type": dev["type"],
                                  "alias": dev["alias"], "online": False,
-                                 "current": None, "history": [], "processes": []})
+                                 "current": None, "history": [], "processes": [],
+                                 "disks": []})
             return {"devices": devices}
 
         try:
@@ -487,6 +488,21 @@ def fetch_compute_stats() -> dict:
                 except sqlite3.OperationalError:
                     pass  # table may not exist yet
 
+                # Fetch latest disk info for this device
+                disks = []
+                try:
+                    disk_rows = conn.execute(
+                        "SELECT mount, label, used_gb, total_gb, pct FROM device_disks "
+                        "WHERE device_id=? ORDER BY snapshot_ts DESC, total_gb DESC",
+                        (did,),
+                    ).fetchall()
+                    disks = [{"mount": r["mount"], "label": r["label"],
+                              "used_gb": r["used_gb"], "total_gb": r["total_gb"],
+                              "pct": r["pct"]}
+                             for r in disk_rows]
+                except sqlite3.OperationalError:
+                    pass  # table may not exist yet
+
                 devices.append({
                     "id": did,
                     "label": dev["label"],
@@ -497,6 +513,7 @@ def fetch_compute_stats() -> dict:
                     "current": current,
                     "history": history,
                     "processes": processes,
+                    "disks": disks,
                 })
             conn.close()
         except Exception as e:
@@ -505,7 +522,7 @@ def fetch_compute_stats() -> dict:
                                  "color": dev["color"], "type": dev["type"],
                                  "alias": dev["alias"], "online": False,
                                  "current": None, "history": [], "processes": [],
-                                 "error": str(e)})
+                                 "disks": [], "error": str(e)})
 
         return {"devices": devices}
 
@@ -566,6 +583,17 @@ def _ensure_ingest_tables(conn):
             kind TEXT DEFAULT 'process'
         );
         CREATE INDEX IF NOT EXISTS idx_proc_ts ON device_processes (device_id, snapshot_ts);
+        CREATE TABLE IF NOT EXISTS device_disks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_ts INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            mount TEXT NOT NULL,
+            label TEXT,
+            used_gb REAL,
+            total_gb REAL,
+            pct REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_disk_ts ON device_disks (device_id, snapshot_ts);
     """)
     conn.commit()
 
@@ -630,6 +658,22 @@ async def ingest_stats(request: Request):
                     (ts, device_id, proc.get("name", "?"),
                      proc.get("cpu", 0), proc.get("mem", 0),
                      proc.get("kind", "process")),
+                )
+
+        # Insert disks if provided
+        disks = body.get("disks", [])
+        if disks:
+            conn.execute(
+                "DELETE FROM device_disks WHERE device_id=?", (device_id,))
+            for dk in disks:
+                conn.execute(
+                    """INSERT INTO device_disks
+                       (snapshot_ts, device_id, mount, label, used_gb, total_gb, pct)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (ts, device_id, dk.get("mount", "?"),
+                     dk.get("label", dk.get("mount", "?")),
+                     dk.get("used_gb", 0), dk.get("total_gb", 0),
+                     dk.get("pct", 0)),
                 )
 
         conn.commit()
@@ -839,7 +883,16 @@ h1 span { color: #ff6b6b; font-weight: 400; }
     gap: 6px;
     font-size: 0.7em;
     color: #666;
-    margin-bottom: 8px;
+    margin-bottom: 4px;
+}
+.disk-row span:first-child {
+    min-width: 70px;
+    white-space: nowrap;
+}
+.disk-row span:last-child {
+    min-width: 95px;
+    text-align: right;
+    white-space: nowrap;
 }
 .disk-track {
     flex: 1;
@@ -1207,11 +1260,15 @@ function renderDeviceCard(dev) {
             <span>up ${fmtUptime(c.uptime_secs)}</span>
         </div>
 
-        ${c.disk_used_gb != null ? `<div class="disk-row">
+        ${(dev.disks && dev.disks.length) ? dev.disks.map(dk => `<div class="disk-row">
+            <span>${dk.label}</span>
+            <div class="disk-track"><div class="disk-fill" style="width:${dk.pct || 0}%;background:${dk.pct > 80 ? '#f87171' : dk.pct > 60 ? '#fbbf24' : '#5c6bc0'}"></div></div>
+            <span>${dk.used_gb}/${dk.total_gb} GB</span>
+        </div>`).join('') : (c.disk_used_gb != null ? `<div class="disk-row">
             <span>Disk</span>
             <div class="disk-track"><div class="disk-fill" style="width:${c.disk_pct || 0}%"></div></div>
             <span>${c.disk_used_gb}/${c.disk_total_gb} GB</span>
-        </div>` : ''}
+        </div>` : '')}
 
         ${servicesHtml}
     </div>`;

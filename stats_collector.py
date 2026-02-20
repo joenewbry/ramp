@@ -65,6 +65,17 @@ def init_db(conn):
             kind TEXT DEFAULT 'process'
         );
         CREATE INDEX IF NOT EXISTS idx_proc_ts ON device_processes (device_id, snapshot_ts);
+        CREATE TABLE IF NOT EXISTS device_disks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_ts INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            mount TEXT NOT NULL,
+            label TEXT,
+            used_gb REAL,
+            total_gb REAL,
+            pct REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_disk_ts ON device_disks (device_id, snapshot_ts);
     """)
     conn.commit()
 
@@ -254,17 +265,43 @@ def collect() -> dict:
     ram_used_mb = mem.used // (1024 * 1024)
     ram_total_mb = mem.total // (1024 * 1024)
 
-    # Disk
-    try:
-        disk = psutil.disk_usage("/ssd")
-        disk_pct = disk.percent
-        disk_used_gb = round(disk.used / (1024 ** 3), 2)
-        disk_total_gb = round(disk.total / (1024 ** 3), 2)
-    except FileNotFoundError:
-        disk = psutil.disk_usage("/")
-        disk_pct = disk.percent
-        disk_used_gb = round(disk.used / (1024 ** 3), 2)
-        disk_total_gb = round(disk.total / (1024 ** 3), 2)
+    # Disk — collect all mounted physical partitions
+    disks = []
+    DISK_LABELS = {
+        "/": "eMMC",
+        "/ssd": "NVMe",
+        "/mnt/pirate-data": "2TB External",
+    }
+    seen_devices = set()
+    for part in psutil.disk_partitions(all=False):
+        if part.device in seen_devices:
+            continue
+        if part.fstype in ("squashfs", "tmpfs", "devtmpfs", "overlay", "vfat"):
+            continue
+        seen_devices.add(part.device)
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+        except (PermissionError, FileNotFoundError):
+            continue
+        disks.append({
+            "mount": part.mountpoint,
+            "label": DISK_LABELS.get(part.mountpoint, part.mountpoint),
+            "used_gb": round(usage.used / (1024 ** 3), 2),
+            "total_gb": round(usage.total / (1024 ** 3), 2),
+            "pct": usage.percent,
+        })
+
+    # Primary disk for backward compat (prefer /ssd, fallback /)
+    primary = next((d for d in disks if d["mount"] == "/ssd"),
+                   next((d for d in disks if d["mount"] == "/"), None))
+    if primary:
+        disk_pct = primary["pct"]
+        disk_used_gb = primary["used_gb"]
+        disk_total_gb = primary["total_gb"]
+    else:
+        disk_pct = None
+        disk_used_gb = None
+        disk_total_gb = None
 
     # Uptime
     uptime_secs = int(time.time() - psutil.boot_time())
@@ -284,6 +321,7 @@ def collect() -> dict:
         "gpu_temp": None,
         "uptime_secs": uptime_secs,
         "power_mw": None,
+        "disks": disks,
     }
 
     # Merge GPU data based on platform
@@ -356,6 +394,8 @@ def main():
                 ok = push_data(row, processes)
                 status = "pushed" if ok else "push-failed"
             else:
+                # Build stats row without disks array (stored separately)
+                stats_row = {k: v for k, v in row.items() if k != "disks"}
                 conn.execute(
                     """INSERT INTO device_stats
                        (timestamp, device_id, cpu_pct, gpu_pct,
@@ -367,7 +407,7 @@ def main():
                         :ram_pct, :ram_used_mb, :ram_total_mb,
                         :disk_pct, :disk_used_gb, :disk_total_gb,
                         :cpu_temp, :gpu_temp, :uptime_secs, :power_mw)""",
-                    row,
+                    stats_row,
                 )
                 # Update processes
                 ts = row["timestamp"]
@@ -383,12 +423,27 @@ def main():
                          proc.get("cpu", 0), proc.get("mem", 0),
                          proc.get("kind", "process")),
                     )
+                # Update disks
+                disks = row.get("disks", [])
+                if disks:
+                    conn.execute(
+                        "DELETE FROM device_disks WHERE device_id=?",
+                        (DEVICE_ID,))
+                    for dk in disks:
+                        conn.execute(
+                            """INSERT INTO device_disks
+                               (snapshot_ts, device_id, mount, label, used_gb, total_gb, pct)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (ts, DEVICE_ID, dk["mount"], dk.get("label", dk["mount"]),
+                             dk["used_gb"], dk["total_gb"], dk["pct"]),
+                        )
                 conn.commit()
 
                 # Prune rows older than PRUNE_DAYS
                 cutoff = int(time.time()) - (PRUNE_DAYS * 86400)
                 conn.execute("DELETE FROM device_stats WHERE timestamp < ?", (cutoff,))
                 conn.execute("DELETE FROM device_processes WHERE snapshot_ts < ?", (cutoff,))
+                conn.execute("DELETE FROM device_disks WHERE snapshot_ts < ?", (cutoff,))
                 conn.commit()
                 status = "written"
 
