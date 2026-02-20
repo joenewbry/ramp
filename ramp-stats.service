@@ -10,6 +10,7 @@ ExecStart=/ssd/ramp/.venv/bin/python stats_collector.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/ssd/ramp/stats.env
 StandardOutput=append:/ssd/logs/ramp-stats.log
 StandardError=append:/ssd/logs/ramp-stats.log
 

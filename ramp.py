@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
@@ -63,9 +63,11 @@ DEFAULT_PORT = 8097
 STATS_DB_PATH = Path("/ssd/ramp/stats.db")
 
 KNOWN_DEVICES = [
-    {"id": "jetson-orin-nano",      "label": "Jetson Orin Nano",      "color": "#7c8aff"},
-    {"id": "nvidia-spark",          "label": "NVIDIA Spark",           "color": "#60a5fa"},
-    {"id": "rtx4080-workstation",   "label": "RTX 4080 Workstation",   "color": "#a78bfa"},
+    {"id": "jetson-orin-nano",      "label": "Jetson Orin Nano",      "color": "#7c8aff",  "type": "jetson",      "alias": "Prometheus"},
+    {"id": "nvidia-dgx-spark",     "label": "NVIDIA DGX Spark",       "color": "#60a5fa",  "type": "dgx",         "alias": "Spark"},
+    {"id": "rtx4080-workstation",   "label": "RTX 4080 Workstation",   "color": "#a78bfa",  "type": "workstation", "alias": "Workstation"},
+    {"id": "orin-nano-2",           "label": "Orin Nano #2",           "color": "#34d399",  "type": "jetson",      "alias": "Orin-2"},
+    {"id": "orin-nano-3",           "label": "Orin Nano #3",           "color": "#fbbf24",  "type": "jetson",      "alias": "Orin-3"},
 ]
 
 app = FastAPI(title="Ramp Dashboard", version="0.1.0")
@@ -438,12 +440,14 @@ def fetch_compute_stats() -> dict:
         if not STATS_DB_PATH.exists():
             for dev in KNOWN_DEVICES:
                 devices.append({"id": dev["id"], "label": dev["label"],
-                                 "color": dev["color"], "online": False,
-                                 "current": None, "history": []})
+                                 "color": dev["color"], "type": dev["type"],
+                                 "alias": dev["alias"], "online": False,
+                                 "current": None, "history": [], "processes": []})
             return {"devices": devices}
 
         try:
             conn = sqlite3.connect(str(STATS_DB_PATH))
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.row_factory = sqlite3.Row
             cutoff_24h = int(time.time()) - 86400
 
@@ -459,27 +463,49 @@ def fetch_compute_stats() -> dict:
                 online = bool(current and (time.time() - current["timestamp"]) < 180)
 
                 history_rows = conn.execute(
-                    "SELECT timestamp, cpu_pct, gpu_pct FROM device_stats "
+                    "SELECT timestamp, cpu_pct, gpu_pct, ram_pct, cpu_temp, gpu_temp, power_mw "
+                    "FROM device_stats "
                     "WHERE device_id=? AND timestamp > ? ORDER BY timestamp ASC",
                     (did, cutoff_24h),
                 ).fetchall()
-                history = [{"ts": r["timestamp"], "cpu": r["cpu_pct"], "gpu": r["gpu_pct"]}
+                history = [{"ts": r["timestamp"], "cpu": r["cpu_pct"], "gpu": r["gpu_pct"],
+                            "ram": r["ram_pct"], "cpu_temp": r["cpu_temp"],
+                            "gpu_temp": r["gpu_temp"], "power": r["power_mw"]}
                            for r in history_rows]
+
+                # Fetch latest processes for this device
+                processes = []
+                try:
+                    proc_rows = conn.execute(
+                        "SELECT name, cpu_pct, mem_pct, kind FROM device_processes "
+                        "WHERE device_id=? ORDER BY snapshot_ts DESC, cpu_pct DESC LIMIT 10",
+                        (did,),
+                    ).fetchall()
+                    processes = [{"name": r["name"], "cpu": r["cpu_pct"],
+                                  "mem": r["mem_pct"], "kind": r["kind"]}
+                                 for r in proc_rows]
+                except sqlite3.OperationalError:
+                    pass  # table may not exist yet
 
                 devices.append({
                     "id": did,
                     "label": dev["label"],
                     "color": dev["color"],
+                    "type": dev["type"],
+                    "alias": dev["alias"],
                     "online": online,
                     "current": current,
                     "history": history,
+                    "processes": processes,
                 })
             conn.close()
         except Exception as e:
             for dev in KNOWN_DEVICES:
                 devices.append({"id": dev["id"], "label": dev["label"],
-                                 "color": dev["color"], "online": False,
-                                 "current": None, "history": [], "error": str(e)})
+                                 "color": dev["color"], "type": dev["type"],
+                                 "alias": dev["alias"], "online": False,
+                                 "current": None, "history": [], "processes": [],
+                                 "error": str(e)})
 
         return {"devices": devices}
 
@@ -516,6 +542,108 @@ async def api_compute():
     return JSONResponse(fetch_compute_stats())
 
 
+def _ensure_ingest_tables(conn):
+    """Ensure stats and process tables exist for ingest."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS device_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            cpu_pct REAL, gpu_pct REAL,
+            ram_pct REAL, ram_used_mb INTEGER, ram_total_mb INTEGER,
+            disk_pct REAL, disk_used_gb REAL, disk_total_gb REAL,
+            cpu_temp REAL, gpu_temp REAL,
+            uptime_secs INTEGER, power_mw INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_ts ON device_stats (timestamp, device_id);
+        CREATE TABLE IF NOT EXISTS device_processes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_ts INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            cpu_pct REAL,
+            mem_pct REAL,
+            kind TEXT DEFAULT 'process'
+        );
+        CREATE INDEX IF NOT EXISTS idx_proc_ts ON device_processes (device_id, snapshot_ts);
+    """)
+    conn.commit()
+
+
+@app.post("/api/ingest/stats")
+async def ingest_stats(request: Request):
+    """Accept pushed stats from remote device collectors."""
+    body = await request.json()
+    device_id = body.get("device_id")
+    if not device_id:
+        return JSONResponse({"error": "device_id required"}, status_code=400)
+
+    try:
+        STATS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(STATS_DB_PATH))
+        conn.execute("PRAGMA journal_mode=WAL")
+        _ensure_ingest_tables(conn)
+
+        # Insert device stats
+        row = {
+            "timestamp": body.get("timestamp", int(time.time())),
+            "device_id": device_id,
+            "cpu_pct": body.get("cpu_pct"),
+            "gpu_pct": body.get("gpu_pct"),
+            "ram_pct": body.get("ram_pct"),
+            "ram_used_mb": body.get("ram_used_mb"),
+            "ram_total_mb": body.get("ram_total_mb"),
+            "disk_pct": body.get("disk_pct"),
+            "disk_used_gb": body.get("disk_used_gb"),
+            "disk_total_gb": body.get("disk_total_gb"),
+            "cpu_temp": body.get("cpu_temp"),
+            "gpu_temp": body.get("gpu_temp"),
+            "uptime_secs": body.get("uptime_secs"),
+            "power_mw": body.get("power_mw"),
+        }
+        conn.execute(
+            """INSERT INTO device_stats
+               (timestamp, device_id, cpu_pct, gpu_pct,
+                ram_pct, ram_used_mb, ram_total_mb,
+                disk_pct, disk_used_gb, disk_total_gb,
+                cpu_temp, gpu_temp, uptime_secs, power_mw)
+               VALUES
+               (:timestamp, :device_id, :cpu_pct, :gpu_pct,
+                :ram_pct, :ram_used_mb, :ram_total_mb,
+                :disk_pct, :disk_used_gb, :disk_total_gb,
+                :cpu_temp, :gpu_temp, :uptime_secs, :power_mw)""",
+            row,
+        )
+
+        # Insert processes if provided
+        processes = body.get("processes", [])
+        ts = row["timestamp"]
+        if processes:
+            # Clear old processes for this device
+            conn.execute(
+                "DELETE FROM device_processes WHERE device_id=?", (device_id,))
+            for proc in processes[:10]:
+                conn.execute(
+                    """INSERT INTO device_processes
+                       (snapshot_ts, device_id, name, cpu_pct, mem_pct, kind)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (ts, device_id, proc.get("name", "?"),
+                     proc.get("cpu", 0), proc.get("mem", 0),
+                     proc.get("kind", "process")),
+                )
+
+        conn.commit()
+        conn.close()
+
+        # Invalidate compute cache so next fetch picks up new data
+        with _cache_lock:
+            _cache.pop("compute", None)
+
+        return JSONResponse({"status": "ok", "device_id": device_id})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     return DASHBOARD_HTML
@@ -530,7 +658,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ramp — Acceleration Dashboard</title>
+<title>Ramp — Factory Floor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -538,7 +666,7 @@ body {
     font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
     background: #06060f;
     color: #e0e0e0;
-    padding: 20px 24px;
+    padding: 16px 20px;
     min-height: 100vh;
 }
 
@@ -547,38 +675,259 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-bottom: 24px;
+    margin-bottom: 12px;
     border-bottom: 1px solid #1a1a3a;
-    padding-bottom: 12px;
+    padding-bottom: 10px;
 }
-h1 { color: #7c8aff; font-size: 1.6em; letter-spacing: -0.5px; }
+h1 { color: #7c8aff; font-size: 1.4em; letter-spacing: -0.5px; }
 h1 span { color: #ff6b6b; font-weight: 400; }
-.subtitle { color: #555; font-size: 0.8em; }
-.refresh-info { color: #444; font-size: 0.72em; }
+.refresh-info { color: #444; font-size: 0.7em; }
 
-/* Section */
-h2 {
+/* Fleet summary bar */
+.fleet-summary {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding: 10px 16px;
+    background: linear-gradient(90deg, #0e0e22 0%, #141430 100%);
+    border: 1px solid #2a2a4a;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    font-size: 0.8em;
+    flex-wrap: wrap;
+}
+.fleet-summary .fleet-label {
+    color: #5c6bc0;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-size: 0.85em;
+}
+.fleet-summary .fleet-stat {
+    color: #888;
+}
+.fleet-summary .fleet-stat .val {
+    font-weight: 700;
+    margin-right: 2px;
+}
+
+/* Fleet grid — 3 columns */
+.fleet-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-bottom: 20px;
+}
+@media (max-width: 1100px) {
+    .fleet-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 700px) {
+    .fleet-grid { grid-template-columns: 1fr; }
+}
+
+/* Device card */
+.dev-card {
+    background: linear-gradient(135deg, #0e0e22 0%, #141430 100%);
+    border: 1px solid #2a2a4a;
+    border-radius: 10px;
+    padding: 16px 18px;
+    min-height: 340px;
+    display: flex;
+    flex-direction: column;
+}
+.dev-card.offline {
+    border-style: dashed;
+    opacity: 0.35;
+    min-height: 160px;
+}
+.dev-card.vm-card {
+    min-height: 160px;
+}
+.dev-card .dev-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.dev-card .dev-alias {
+    font-size: 1em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.dev-card .dev-type {
+    font-size: 0.7em;
+    color: #666;
+    margin-bottom: 14px;
+}
+.online-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+.online-dot.on {
+    background: #4ade80;
+    box-shadow: 0 0 8px #4ade80;
+}
+.online-dot.off { background: #555; }
+
+/* Utilization bars */
+.util-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+.util-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78em;
+}
+.util-label {
+    width: 32px;
+    color: #888;
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.85em;
+}
+.util-track {
+    flex: 1;
+    height: 16px;
+    background: rgba(0,0,0,0.4);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+}
+.util-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease;
+}
+.util-pct {
+    width: 38px;
+    text-align: right;
+    font-weight: 700;
+    font-size: 0.9em;
+}
+
+/* Device chart */
+.dev-chart-wrap {
+    flex: 1;
+    min-height: 100px;
+    max-height: 150px;
+    position: relative;
+    margin-bottom: 10px;
+}
+
+/* Device stats footer */
+.dev-stats {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    font-size: 0.72em;
+    color: #666;
+    margin-bottom: 8px;
+}
+.dev-stats span { white-space: nowrap; }
+
+/* Disk bar (compact) */
+.disk-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.7em;
+    color: #666;
+    margin-bottom: 8px;
+}
+.disk-track {
+    flex: 1;
+    height: 6px;
+    background: rgba(0,0,0,0.4);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.disk-fill {
+    height: 100%;
+    background: #5c6bc0;
+    border-radius: 3px;
+}
+
+/* Services section */
+.dev-services {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 0.7em;
+}
+.svc-pill {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    background: rgba(74,222,128,0.08);
+    border: 1px solid rgba(74,222,128,0.2);
+    border-radius: 10px;
+    color: #4ade80;
+}
+.svc-pill.docker {
+    background: rgba(96,165,250,0.08);
+    border-color: rgba(96,165,250,0.2);
+    color: #60a5fa;
+}
+.svc-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+/* Collapsible sections */
+.collapsible-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
     color: #5c6bc0;
     font-size: 1.05em;
-    margin: 28px 0 14px;
+    margin: 24px 0 10px;
     border-bottom: 1px solid #1a1a3a;
     padding-bottom: 6px;
     text-transform: uppercase;
     letter-spacing: 1.5px;
+    font-weight: 700;
+}
+.collapsible-header:hover { color: #7c8aff; }
+.collapsible-header .arrow {
+    transition: transform 0.2s;
+    font-size: 0.8em;
+}
+.collapsible-header.collapsed .arrow {
+    transform: rotate(-90deg);
+}
+.collapsible-body {
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+}
+.collapsible-body.hidden {
+    max-height: 0 !important;
+    overflow: hidden;
 }
 
-/* Acceleration hero cards */
+/* Acceleration cards (kept from original, slightly compressed) */
 .accel-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
     margin-bottom: 8px;
 }
 .accel-card {
     background: linear-gradient(135deg, #0e0e22 0%, #141430 100%);
     border: 1px solid #2a2a4a;
     border-radius: 10px;
-    padding: 20px;
+    padding: 16px;
     position: relative;
     overflow: hidden;
 }
@@ -587,11 +936,11 @@ h2 {
     border-style: dashed;
 }
 .accel-card .provider {
-    font-size: 0.75em;
+    font-size: 0.72em;
     text-transform: uppercase;
     letter-spacing: 2px;
     color: #888;
-    margin-bottom: 12px;
+    margin-bottom: 10px;
 }
 .accel-card .provider .dot {
     display: inline-block;
@@ -602,91 +951,94 @@ h2 {
 }
 .accel-card .metrics-row {
     display: flex;
-    gap: 16px;
+    gap: 12px;
     flex-wrap: wrap;
 }
 .metric-box {
     flex: 1;
-    min-width: 80px;
+    min-width: 75px;
     text-align: center;
-    padding: 10px 6px;
+    padding: 8px 4px;
     background: rgba(0,0,0,0.3);
     border-radius: 6px;
 }
 .metric-box .label {
-    font-size: 0.65em;
+    font-size: 0.6em;
     text-transform: uppercase;
     letter-spacing: 1px;
     color: #666;
-    margin-bottom: 4px;
+    margin-bottom: 3px;
 }
 .metric-box .value {
-    font-size: 1.5em;
+    font-size: 1.3em;
     font-weight: 700;
 }
 .metric-box .unit {
-    font-size: 0.6em;
+    font-size: 0.55em;
     color: #555;
 }
 .positive { color: #4ade80; }
 .negative { color: #f87171; }
 .neutral { color: #7c8aff; }
-
-/* Acceleration emphasis */
 .metric-box.accel-emphasis {
     background: rgba(124, 138, 255, 0.08);
     border: 1px solid rgba(124, 138, 255, 0.2);
 }
-.metric-box.accel-emphasis .value {
-    font-size: 1.8em;
-}
+.metric-box.accel-emphasis .value { font-size: 1.5em; }
 
-/* Chart */
+/* Chart section */
 .chart-section {
     background: #0e0e22;
     border: 1px solid #1a1a3a;
     border-radius: 10px;
-    padding: 20px;
-    margin: 16px 0;
+    padding: 16px;
+    margin: 12px 0;
 }
-.chart-container { position: relative; height: 260px; }
-.chart-tabs {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 12px;
+.chart-container { position: relative; height: 220px; }
+
+/* Table */
+.accel-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78em;
+    margin-top: 10px;
 }
-.chart-tab {
-    padding: 4px 12px;
-    border-radius: 4px;
-    font-size: 0.75em;
-    cursor: pointer;
-    background: #1a1a3a;
-    color: #888;
-    border: 1px solid #2a2a4a;
-    font-family: inherit;
+.accel-table th {
+    text-align: left;
+    padding: 6px 8px;
+    background: #12122a;
+    color: #5c6bc0;
+    border-bottom: 2px solid #2a2a5a;
+    font-weight: 600;
 }
-.chart-tab.active {
-    background: #2a2a5a;
-    color: #7c8aff;
-    border-color: #5c6bc0;
+.accel-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #1a1a2a;
 }
+.accel-table tr:hover { background: #121230; }
+.accel-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Error / hints */
+.error-msg { color: #f87171; font-size: 0.8em; padding: 8px; }
+.config-hint { color: #666; font-size: 0.75em; font-style: italic; padding: 6px 0; }
 
 /* Status pills */
 .status-bar {
     display: flex;
-    gap: 12px;
+    gap: 10px;
     flex-wrap: wrap;
-    margin-top: 12px;
+    margin-top: 8px;
+    margin-bottom: 4px;
 }
 .status-pill {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
+    gap: 5px;
+    padding: 3px 8px;
     background: #12122a;
     border: 1px solid #2a2a4a;
     border-radius: 20px;
-    font-size: 0.75em;
+    font-size: 0.7em;
 }
 .status-pill .dot {
     width: 6px;
@@ -697,97 +1049,6 @@ h2 {
 .dot-red { background: #f87171; }
 .dot-yellow { background: #fbbf24; }
 .dot-gray { background: #555; }
-
-/* Error msg */
-.error-msg { color: #f87171; font-size: 0.8em; padding: 8px; }
-.config-hint { color: #666; font-size: 0.75em; font-style: italic; padding: 8px 0; }
-
-/* Acceleration table */
-.accel-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.82em;
-    margin-top: 12px;
-}
-.accel-table th {
-    text-align: left;
-    padding: 8px 10px;
-    background: #12122a;
-    color: #5c6bc0;
-    border-bottom: 2px solid #2a2a5a;
-    font-weight: 600;
-}
-.accel-table td {
-    padding: 6px 10px;
-    border-bottom: 1px solid #1a1a2a;
-}
-.accel-table tr:hover { background: #121230; }
-.accel-table .num { text-align: right; font-variant-numeric: tabular-nums; }
-
-/* Compute fleet */
-.compute-card {
-    background: linear-gradient(135deg, #0e0e22 0%, #141430 100%);
-    border: 1px solid #2a2a4a;
-    border-radius: 10px;
-    padding: 20px;
-    position: relative;
-}
-.compute-card.offline {
-    border-style: dashed;
-    opacity: 0.35;
-}
-.compute-card .device-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 14px;
-}
-.compute-card .device-name {
-    font-size: 0.78em;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: #aaa;
-    font-weight: 600;
-}
-.stat-pills {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
-}
-.stat-pill {
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-size: 0.75em;
-    font-weight: 700;
-    background: rgba(0,0,0,0.35);
-    border: 1px solid #2a2a4a;
-    min-width: 56px;
-    text-align: center;
-}
-.stat-pill .pill-label {
-    color: #666;
-    font-size: 0.75em;
-    font-weight: 400;
-    display: block;
-    letter-spacing: 0.5px;
-}
-.stat-green { color: #4ade80; }
-.stat-yellow { color: #fbbf24; }
-.stat-red { color: #f87171; }
-.compute-meta {
-    font-size: 0.72em;
-    color: #555;
-    margin-top: 6px;
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-}
-.sparkline-wrap {
-    margin-top: 12px;
-    height: 60px;
-    position: relative;
-}
 </style>
 </head>
 <body>
@@ -795,409 +1056,255 @@ h2 {
 <div class="header">
     <div>
         <h1>Ramp <span>// acceleration</span></h1>
-        <div class="subtitle">Focus on what's improving, not just what is.</div>
     </div>
     <div class="refresh-info" id="refresh-info">Loading...</div>
 </div>
 
-<div id="app"><div style="color:#555">Loading data...</div></div>
+<div id="fleet-summary"></div>
+<div id="fleet-grid"></div>
+<div id="api-section"></div>
 
 <script>
 let charts = {};
+let computeCharts = {};
+let _lastApiData = null;
+let _lastComputeData = null;
+let _apiSectionCollapsed = true;
+
+// -----------------------------------------------------------------------
+// Formatters
+// -----------------------------------------------------------------------
 
 function fmtNum(n) {
-    if (typeof n !== 'number' || isNaN(n)) return '—';
+    if (typeof n !== 'number' || isNaN(n)) return '\u2014';
     if (Math.abs(n) >= 1e9) return (n/1e9).toFixed(1) + 'B';
     if (Math.abs(n) >= 1e6) return (n/1e6).toFixed(1) + 'M';
     if (Math.abs(n) >= 1e3) return (n/1e3).toFixed(1) + 'K';
     return n.toLocaleString();
 }
-
 function fmtDollar(n) {
-    if (typeof n !== 'number' || isNaN(n)) return '—';
+    if (typeof n !== 'number' || isNaN(n)) return '\u2014';
     return '$' + n.toFixed(2);
 }
-
-function signClass(n) {
-    if (n > 0) return 'positive';
-    if (n < 0) return 'negative';
-    return 'neutral';
-}
-
-function signPrefix(n) {
-    return n > 0 ? '+' : '';
-}
-
+function signClass(n) { return n > 0 ? 'positive' : n < 0 ? 'negative' : 'neutral'; }
+function signPrefix(n) { return n > 0 ? '+' : ''; }
 function providerColor(name) {
-    return {anthropic: '#d4a574', openai: '#10b981', xai: '#60a5fa', gcs: '#a78bfa'}[name] || '#888';
+    return {anthropic:'#d4a574', openai:'#10b981', xai:'#60a5fa', gcs:'#a78bfa'}[name] || '#888';
+}
+function fmtPct(v) { return v != null ? v.toFixed(0) + '%' : '\u2014'; }
+function fmtUptime(secs) {
+    if (!secs) return '\u2014';
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    if (d > 0) return d + 'd ' + h + 'h';
+    if (h > 0) return h + 'h ' + m + 'm';
+    return m + 'm';
 }
 
-function renderAccelCard(name, label, data, isCost) {
-    if (!data || !data.configured) {
-        return `<div class="accel-card not-configured">
-            <div class="provider"><span class="dot" style="background:${providerColor(name)}"></span>${label}</div>
-            <div class="config-hint">Not configured. Add admin key to config.env</div>
-        </div>`;
-    }
-    if (data.error && !data.token_metrics) {
-        return `<div class="accel-card">
-            <div class="provider"><span class="dot" style="background:${providerColor(name)}"></span>${label}</div>
-            <div class="error-msg">${data.error}</div>
-        </div>`;
-    }
-
-    const tm = data.token_metrics || {position: 0, velocity: 0, acceleration: 0};
-    const cm = data.cost_metrics || {position: 0, velocity: 0, acceleration: 0};
-    const m = isCost ? cm : tm;
-    const fmt = isCost ? fmtDollar : fmtNum;
-
-    return `<div class="accel-card">
-        <div class="provider"><span class="dot" style="background:${providerColor(name)}"></span>${label}</div>
-        <div class="metrics-row">
-            <div class="metric-box">
-                <div class="label">Position</div>
-                <div class="value neutral">${fmt(m.position)}</div>
-                <div class="unit">${isCost ? 'total spend' : 'total tokens'}</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Velocity</div>
-                <div class="value ${signClass(m.velocity)}">${signPrefix(m.velocity)}${fmt(m.velocity)}</div>
-                <div class="unit">7-day avg/day</div>
-            </div>
-            <div class="metric-box accel-emphasis">
-                <div class="label">Acceleration</div>
-                <div class="value ${signClass(m.acceleration)}">${signPrefix(m.acceleration)}${isCost ? fmtDollar(m.acceleration) : fmtNum(m.acceleration)}</div>
-                <div class="unit">5-day &Delta; velocity</div>
-            </div>
-        </div>
-    </div>`;
-}
-
-function renderGcsCard(gcs) {
-    if (!gcs || !gcs.metrics) {
-        return `<div class="accel-card not-configured">
-            <div class="provider"><span class="dot" style="background:${providerColor('gcs')}"></span>Training Pipeline</div>
-            <div class="config-hint">No GCS data found</div>
-        </div>`;
-    }
-
-    const m = gcs.metrics;
-    return `<div class="accel-card">
-        <div class="provider"><span class="dot" style="background:${providerColor('gcs')}"></span>Training Pipeline (GCS)</div>
-        <div class="metrics-row">
-            <div class="metric-box">
-                <div class="label">Position</div>
-                <div class="value neutral">${fmtNum(m.position)}</div>
-                <div class="unit">total sessions</div>
-            </div>
-            <div class="metric-box">
-                <div class="label">Velocity</div>
-                <div class="value ${signClass(m.velocity)}">${signPrefix(m.velocity)}${fmtNum(m.velocity)}</div>
-                <div class="unit">7-day avg/day</div>
-            </div>
-            <div class="metric-box accel-emphasis">
-                <div class="label">Acceleration</div>
-                <div class="value ${signClass(m.acceleration)}">${signPrefix(m.acceleration)}${fmtNum(m.acceleration)}</div>
-                <div class="unit">5-day &Delta; velocity</div>
-            </div>
-        </div>
-    </div>`;
-}
-
-function renderAccelTable(data) {
-    const rows = [];
-    for (const [name, label] of [['anthropic','Anthropic'],['openai','OpenAI'],['xai','xAI/Grok']]) {
-        const p = data.providers[name];
-        if (!p || !p.configured || !p.token_metrics) continue;
-        const tm = p.token_metrics;
-        const cm = p.cost_metrics || {position:0, velocity:0, acceleration:0};
-        rows.push({name: label, color: providerColor(name), tm, cm});
-    }
-    if (data.gcs_pipeline && data.gcs_pipeline.metrics) {
-        const m = data.gcs_pipeline.metrics;
-        rows.push({name: 'GCS Pipeline', color: providerColor('gcs'),
-            tm: m, cm: {position: 0, velocity: 0, acceleration: 0}});
-    }
-
-    if (!rows.length) return '';
-
-    // Daily acceleration breakdown for last 5 days
-    let dailyHtml = '';
-    for (const r of rows) {
-        const daily = r.tm.daily || [];
-        const last5 = daily.slice(-5);
-        if (!last5.length) continue;
-        dailyHtml += `<tr style="border-top:2px solid #2a2a4a"><td colspan="5" style="color:${r.color};font-weight:bold;padding-top:10px">${r.name}</td></tr>`;
-        for (const d of last5) {
-            dailyHtml += `<tr>
-                <td>${d.date}</td>
-                <td class="num">${fmtNum(d.value)}</td>
-                <td class="num">${fmtNum(d.cumulative)}</td>
-                <td class="num ${signClass(d.velocity)}">${signPrefix(d.velocity)}${fmtNum(d.velocity)}</td>
-                <td class="num ${signClass(d.acceleration)}">${signPrefix(d.acceleration)}${fmtNum(d.acceleration)}</td>
-            </tr>`;
-        }
-    }
-
-    return `<table class="accel-table">
-        <thead><tr>
-            <th>Date</th><th class="num">Value</th><th class="num">Cumulative</th>
-            <th class="num">Velocity</th><th class="num">Acceleration</th>
-        </tr></thead>
-        <tbody>${dailyHtml}</tbody>
-    </table>`;
-}
-
-function renderChart(data) {
-    const datasets = [];
-    const colors = {anthropic: '#d4a574', openai: '#10b981', xai: '#60a5fa', gcs: '#a78bfa'};
-
-    // Get all dates
-    let allDates = new Set();
-    for (const [name, p] of Object.entries(data.providers)) {
-        if (p.token_metrics && p.token_metrics.daily) {
-            p.token_metrics.daily.forEach(d => allDates.add(d.date));
-        }
-    }
-    if (data.gcs_pipeline && data.gcs_pipeline.metrics && data.gcs_pipeline.metrics.daily) {
-        data.gcs_pipeline.metrics.daily.forEach(d => allDates.add(d.date));
-    }
-    allDates = [...allDates].sort();
-    if (!allDates.length) return '';
-
-    // Build acceleration datasets
-    for (const [name, label] of [['anthropic','Anthropic'],['openai','OpenAI'],['xai','xAI']]) {
-        const p = data.providers[name];
-        if (!p || !p.token_metrics || !p.token_metrics.daily) continue;
-        const dateMap = {};
-        p.token_metrics.daily.forEach(d => dateMap[d.date] = d.acceleration);
-        datasets.push({
-            label: label + ' Accel',
-            data: allDates.map(d => dateMap[d] || 0),
-            borderColor: colors[name],
-            backgroundColor: colors[name] + '33',
-            borderWidth: 2,
-            pointRadius: 3,
-            tension: 0.3,
-        });
-    }
-    if (data.gcs_pipeline && data.gcs_pipeline.metrics && data.gcs_pipeline.metrics.daily) {
-        const dateMap = {};
-        data.gcs_pipeline.metrics.daily.forEach(d => dateMap[d.date] = d.acceleration);
-        datasets.push({
-            label: 'GCS Accel',
-            data: allDates.map(d => dateMap[d] || 0),
-            borderColor: colors.gcs,
-            backgroundColor: colors.gcs + '33',
-            borderWidth: 2,
-            pointRadius: 3,
-            tension: 0.3,
-        });
-    }
-
-    return `<div class="chart-section">
-        <div style="font-size:0.85em;color:#5c6bc0;font-weight:600;margin-bottom:12px">ACCELERATION OVER TIME</div>
-        <div class="chart-container"><canvas id="accelChart"></canvas></div>
-    </div>`;
-}
-
-function updateAccelChart(data) {
-    const canvas = document.getElementById('accelChart');
-    if (!canvas) return;
-
-    const colors = {anthropic: '#d4a574', openai: '#10b981', xai: '#60a5fa', gcs: '#a78bfa'};
-    let allDates = new Set();
-    const sources = [];
-
-    for (const [name, label] of [['anthropic','Anthropic'],['openai','OpenAI'],['xai','xAI']]) {
-        const p = data.providers[name];
-        if (!p || !p.token_metrics || !p.token_metrics.daily) continue;
-        p.token_metrics.daily.forEach(d => allDates.add(d.date));
-        sources.push({name, label, daily: p.token_metrics.daily, color: colors[name]});
-    }
-    if (data.gcs_pipeline?.metrics?.daily) {
-        data.gcs_pipeline.metrics.daily.forEach(d => allDates.add(d.date));
-        sources.push({name:'gcs', label:'GCS Pipeline', daily: data.gcs_pipeline.metrics.daily, color: colors.gcs});
-    }
-
-    allDates = [...allDates].sort();
-    if (!allDates.length) return;
-
-    const datasets = sources.map(s => {
-        const dateMap = {};
-        s.daily.forEach(d => dateMap[d.date] = d.acceleration);
-        return {
-            label: s.label,
-            data: allDates.map(d => dateMap[d] || 0),
-            borderColor: s.color,
-            backgroundColor: s.color + '22',
-            borderWidth: 2,
-            pointRadius: 3,
-            pointBackgroundColor: s.color,
-            fill: true,
-            tension: 0.3,
-        };
-    });
-
-    if (charts.accel) {
-        charts.accel.data.labels = allDates;
-        charts.accel.data.datasets = datasets;
-        charts.accel.update('none');
-        return;
-    }
-
-    charts.accel = new Chart(canvas, {
-        type: 'line',
-        data: { labels: allDates, datasets },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: { mode: 'index', intersect: false },
-            plugins: {
-                legend: { labels: { color: '#888', font: { family: "'SF Mono', monospace", size: 11 } } },
-                tooltip: {
-                    backgroundColor: '#1a1a3a',
-                    titleColor: '#e0e0e0',
-                    bodyColor: '#bbb',
-                    borderColor: '#2a2a4a',
-                    borderWidth: 1,
-                },
-            },
-            scales: {
-                x: {
-                    ticks: { color: '#555', font: { size: 10 } },
-                    grid: { color: 'rgba(42,42,74,0.3)' },
-                },
-                y: {
-                    title: { display: true, text: 'Acceleration (Δ velocity)', color: '#5c6bc0', font: { size: 11 } },
-                    ticks: { color: '#666', font: { size: 10 } },
-                    grid: { color: 'rgba(42,42,74,0.3)' },
-                },
-            },
-        },
-    });
-}
-
-function renderStatusBar(data) {
-    const pills = [];
-    for (const [name, label] of [['anthropic','Anthropic'],['openai','OpenAI'],['xai','xAI/Grok']]) {
-        const p = data.providers[name];
-        const ok = p && p.configured && !p.error;
-        const dotClass = !p || !p.configured ? 'dot-gray' : p.error ? 'dot-red' : 'dot-green';
-        pills.push(`<div class="status-pill"><span class="dot ${dotClass}"></span>${label}</div>`);
-    }
-    // GCS
-    const gcsOk = data.gcs_pipeline && data.gcs_pipeline.metrics && data.gcs_pipeline.metrics.position > 0;
-    pills.push(`<div class="status-pill"><span class="dot ${gcsOk ? 'dot-green' : 'dot-yellow'}"></span>GCS Pipeline</div>`);
-
-    // Active VMs
-    const activeVms = data.gcs_pipeline?.active_vms || [];
-    if (activeVms.length) {
-        pills.push(`<div class="status-pill"><span class="dot dot-green"></span>${activeVms.length} VM${activeVms.length>1?'s':''} running</div>`);
-    }
-
-    return `<div class="status-bar">${pills.join('')}</div>`;
-}
-
-function render(data) {
-    const el = document.getElementById('app');
-    document.getElementById('refresh-info').textContent =
-        `Last: ${new Date().toLocaleTimeString()} — refreshes every 30s`;
-
-    el.innerHTML = `
-        <div id="compute-fleet-section"></div>
-
-        ${renderStatusBar(data)}
-
-        <h2>Acceleration Overview — Tokens</h2>
-        <div class="accel-grid">
-            ${renderAccelCard('anthropic', 'Anthropic (Claude)', data.providers.anthropic, false)}
-            ${renderAccelCard('openai', 'OpenAI', data.providers.openai, false)}
-            ${renderAccelCard('xai', 'xAI (Grok)', data.providers.xai, false)}
-            ${renderGcsCard(data.gcs_pipeline)}
-        </div>
-
-        <h2>Acceleration Overview — Spend</h2>
-        <div class="accel-grid">
-            ${renderAccelCard('anthropic', 'Anthropic (Claude)', data.providers.anthropic, true)}
-            ${renderAccelCard('openai', 'OpenAI', data.providers.openai, true)}
-            ${renderAccelCard('xai', 'xAI (Grok)', data.providers.xai, true)}
-        </div>
-
-        ${renderChart(data)}
-
-        <h2>Daily Acceleration Breakdown (Last 5 Days)</h2>
-        ${renderAccelTable(data)}
-    `;
-
-    requestAnimationFrame(() => updateAccelChart(data));
-}
-
-// ---------------------------------------------------------------------------
-// Compute Fleet
-// ---------------------------------------------------------------------------
-
-let computeCharts = {};
-
-function statColor(pct) {
+function utilColor(pct) {
     if (pct == null) return '#555';
     if (pct < 50) return '#4ade80';
     if (pct < 80) return '#fbbf24';
     return '#f87171';
 }
 
-function statClass(pct) {
-    if (pct == null) return '';
-    if (pct < 50) return 'stat-green';
-    if (pct < 80) return 'stat-yellow';
-    return 'stat-red';
+// -----------------------------------------------------------------------
+// Fleet summary bar
+// -----------------------------------------------------------------------
+
+function renderFleetSummary(devices, gcsVms) {
+    const el = document.getElementById('fleet-summary');
+    const online = devices.filter(d => d.online);
+    const total = devices.length;
+    const avgCpu = online.length ? (online.reduce((s, d) => s + (d.current?.cpu_pct || 0), 0) / online.length).toFixed(0) : 0;
+    const avgGpu = online.length ? (online.reduce((s, d) => s + (d.current?.gpu_pct || 0), 0) / online.length).toFixed(0) : 0;
+    const totalPower = online.reduce((s, d) => s + (d.current?.power_mw || 0), 0);
+    const powerStr = totalPower ? (totalPower / 1000).toFixed(1) + 'W' : '\u2014';
+    const vmCount = (gcsVms || []).filter(v => v.status === 'RUNNING').length;
+
+    el.innerHTML = `<div class="fleet-summary">
+        <span class="fleet-label">Fleet</span>
+        <span class="fleet-stat"><span class="val" style="color:${online.length > 0 ? '#4ade80' : '#f87171'}">${online.length}/${total}</span> online</span>
+        <span class="fleet-stat">Avg CPU <span class="val" style="color:${utilColor(+avgCpu)}">${avgCpu}%</span></span>
+        <span class="fleet-stat">Avg GPU <span class="val" style="color:${utilColor(+avgGpu)}">${avgGpu}%</span></span>
+        <span class="fleet-stat">Total Power <span class="val">${powerStr}</span></span>
+        ${vmCount ? `<span class="fleet-stat"><span class="val" style="color:#a78bfa">${vmCount}</span> VMs</span>` : ''}
+    </div>`;
 }
 
-function fmtPct(v) {
-    return v != null ? v.toFixed(0) + '%' : '—';
+// -----------------------------------------------------------------------
+// Utilization bar
+// -----------------------------------------------------------------------
+
+function renderUtilBar(label, pct) {
+    const color = utilColor(pct);
+    const w = pct != null ? Math.min(pct, 100) : 0;
+    return `<div class="util-row">
+        <span class="util-label">${label}</span>
+        <div class="util-track">
+            <div class="util-fill" style="width:${w}%;background:${color}"></div>
+        </div>
+        <span class="util-pct" style="color:${color}">${fmtPct(pct)}</span>
+    </div>`;
 }
 
-function fmtUptime(secs) {
-    if (!secs) return '—';
-    const d = Math.floor(secs / 86400);
-    const h = Math.floor((secs % 86400) / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    if (d > 0) return `${d}d ${h}h`;
-    if (h > 0) return `${h}h ${m}m`;
-    return `${m}m`;
+// -----------------------------------------------------------------------
+// Device card
+// -----------------------------------------------------------------------
+
+function renderDeviceCard(dev) {
+    if (!dev.online || !dev.current) {
+        return `<div class="dev-card offline">
+            <div class="dev-header">
+                <span class="online-dot off"></span>
+                <span class="dev-alias" style="color:${dev.color}">${dev.alias || dev.label}</span>
+            </div>
+            <div class="dev-type">${dev.label}</div>
+            <div style="color:#444;font-size:0.85em;margin-top:16px;text-align:center">OFFLINE</div>
+        </div>`;
+    }
+
+    const c = dev.current;
+    const chartId = 'chart-' + dev.id;
+
+    // Services from processes
+    const procs = dev.processes || [];
+    const dockerProcs = procs.filter(p => p.kind === 'docker');
+    const topProcs = procs.filter(p => p.kind === 'process').slice(0, 6);
+
+    let servicesHtml = '';
+    if (dockerProcs.length || topProcs.length) {
+        const pills = [];
+        for (const d of dockerProcs) {
+            pills.push(`<span class="svc-pill docker"><span class="svc-dot"></span>${d.name}</span>`);
+        }
+        for (const p of topProcs.slice(0, 4)) {
+            pills.push(`<span class="svc-pill"><span class="svc-dot"></span>${p.name}</span>`);
+        }
+        servicesHtml = `<div class="dev-services">${pills.join('')}</div>`;
+    }
+
+    return `<div class="dev-card">
+        <div class="dev-header">
+            <span class="online-dot on"></span>
+            <span class="dev-alias" style="color:${dev.color}">${dev.alias || dev.label}</span>
+        </div>
+        <div class="dev-type">${dev.label}</div>
+
+        <div class="util-bars">
+            ${renderUtilBar('CPU', c.cpu_pct)}
+            ${renderUtilBar('GPU', c.gpu_pct)}
+            ${renderUtilBar('RAM', c.ram_pct)}
+        </div>
+
+        <div class="dev-chart-wrap"><canvas id="${chartId}"></canvas></div>
+
+        <div class="dev-stats">
+            ${c.cpu_temp != null ? `<span>${c.cpu_temp.toFixed(0)}\u00B0C cpu</span>` : ''}
+            ${c.gpu_temp != null ? `<span>${c.gpu_temp.toFixed(0)}\u00B0C gpu</span>` : ''}
+            ${c.power_mw != null ? `<span>${(c.power_mw/1000).toFixed(1)}W</span>` : ''}
+            <span>up ${fmtUptime(c.uptime_secs)}</span>
+        </div>
+
+        ${c.disk_used_gb != null ? `<div class="disk-row">
+            <span>Disk</span>
+            <div class="disk-track"><div class="disk-fill" style="width:${c.disk_pct || 0}%"></div></div>
+            <span>${c.disk_used_gb}/${c.disk_total_gb} GB</span>
+        </div>` : ''}
+
+        ${servicesHtml}
+    </div>`;
 }
 
-function renderDeviceSparkline(canvasId, history, color) {
+// -----------------------------------------------------------------------
+// VM card
+// -----------------------------------------------------------------------
+
+function renderVmCard(gcsVms) {
+    const vms = (gcsVms || []);
+    const running = vms.filter(v => v.status === 'RUNNING');
+
+    let vmList = '';
+    if (running.length) {
+        vmList = running.map(v =>
+            `<div style="display:flex;align-items:center;gap:6px;font-size:0.78em;margin:3px 0">
+                <span class="online-dot on" style="width:6px;height:6px"></span>
+                <span style="color:#e0e0e0">${v.name}</span>
+                <span style="color:#555;font-size:0.85em">(${v.type})</span>
+            </div>`
+        ).join('');
+    }
+
+    const stopped = vms.filter(v => v.status !== 'RUNNING');
+    if (stopped.length) {
+        vmList += stopped.map(v =>
+            `<div style="display:flex;align-items:center;gap:6px;font-size:0.78em;margin:3px 0;opacity:0.4">
+                <span class="online-dot off" style="width:6px;height:6px"></span>
+                <span>${v.name}</span>
+            </div>`
+        ).join('');
+    }
+
+    return `<div class="dev-card vm-card">
+        <div class="dev-header">
+            <span style="color:#a78bfa;font-size:1.1em">&#9729;</span>
+            <span class="dev-alias" style="color:#a78bfa">Cloud VMs</span>
+        </div>
+        <div class="dev-type">GCP Compute Engine</div>
+        ${running.length ? `<div style="color:#a78bfa;font-weight:700;font-size:0.85em;margin:8px 0">${running.length} running</div>` :
+            `<div style="color:#444;font-size:0.85em;margin:8px 0">No VMs running</div>`}
+        ${vmList}
+    </div>`;
+}
+
+// -----------------------------------------------------------------------
+// Device chart (24h CPU/GPU/RAM)
+// -----------------------------------------------------------------------
+
+function renderDeviceChart(canvasId, history, dev) {
     const canvas = document.getElementById(canvasId);
-    if (!canvas || !history || !history.length) return;
+    if (!canvas || !history || history.length < 2) return;
 
     const labels = history.map(h => {
         const d = new Date(h.ts * 1000);
         return d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0');
     });
-    const cpuData = history.map(h => h.cpu);
-    const gpuData = history.map(h => h.gpu);
 
     const datasets = [{
         label: 'CPU',
-        data: cpuData,
-        borderColor: color,
-        backgroundColor: color + '22',
+        data: history.map(h => h.cpu),
+        borderColor: dev.color,
+        backgroundColor: dev.color + '18',
         borderWidth: 1.5,
         pointRadius: 0,
         fill: true,
         tension: 0.3,
     }];
-    if (gpuData.some(v => v != null)) {
+
+    if (history.some(h => h.gpu != null)) {
         datasets.push({
             label: 'GPU',
-            data: gpuData,
+            data: history.map(h => h.gpu),
             borderColor: '#f87171',
-            backgroundColor: '#f8717122',
+            backgroundColor: '#f8717112',
             borderWidth: 1.5,
+            pointRadius: 0,
+            fill: true,
+            tension: 0.3,
+        });
+    }
+    if (history.some(h => h.ram != null)) {
+        datasets.push({
+            label: 'RAM',
+            data: history.map(h => h.ram),
+            borderColor: '#a78bfa',
+            backgroundColor: '#a78bfa12',
+            borderWidth: 1,
             pointRadius: 0,
             fill: false,
             tension: 0.3,
+            borderDash: [4, 3],
         });
     }
 
@@ -1215,122 +1322,292 @@ function renderDeviceSparkline(canvasId, history, color) {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: { display: false },
-                tooltip: { enabled: false },
+                legend: {
+                    display: true,
+                    position: 'top',
+                    labels: { color: '#666', font: { size: 9 }, boxWidth: 12, padding: 6 },
+                },
+                tooltip: {
+                    backgroundColor: '#1a1a3a',
+                    titleColor: '#e0e0e0',
+                    bodyColor: '#bbb',
+                    borderColor: '#2a2a4a',
+                    borderWidth: 1,
+                    titleFont: { size: 10 },
+                    bodyFont: { size: 10 },
+                },
             },
             scales: {
-                x: { display: false },
-                y: {
-                    display: false,
-                    min: 0,
-                    max: 100,
+                x: {
+                    display: true,
+                    ticks: { color: '#444', font: { size: 8 }, maxTicksLimit: 6 },
+                    grid: { display: false },
                 },
+                y: { display: false, min: 0, max: 100 },
             },
             animation: false,
         },
     });
 }
 
-function renderComputeFleet(data) {
-    const el = document.getElementById('compute-fleet-section');
-    if (!el) return;
-    if (!data || !data.devices) {
-        el.innerHTML = '';
-        return;
-    }
+// -----------------------------------------------------------------------
+// Fleet render
+// -----------------------------------------------------------------------
 
-    const cards = data.devices.map(dev => {
-        if (!dev.online || !dev.current) {
-            return `<div class="compute-card offline">
-                <div class="device-header">
-                    <span class="dot dot-gray" style="width:8px;height:8px;border-radius:50%;display:inline-block"></span>
-                    <span class="device-name" style="color:${dev.color}">${dev.label}</span>
-                </div>
-                <div style="color:#444;font-size:0.8em">Not connected</div>
-            </div>`;
-        }
+function renderComputeFleet(computeData, apiData) {
+    const devices = computeData?.devices || [];
+    const gcsVms = apiData?.gcs_pipeline?.all_vms || [];
 
-        const c = dev.current;
-        const sparkId = `spark-${dev.id}`;
+    // Fleet summary
+    renderFleetSummary(devices, gcsVms);
 
-        return `<div class="compute-card">
-            <div class="device-header">
-                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#4ade80;box-shadow:0 0 6px #4ade80"></span>
-                <span class="device-name" style="color:${dev.color}">${dev.label}</span>
-            </div>
-            <div class="stat-pills">
-                <div class="stat-pill">
-                    <span class="pill-label">CPU</span>
-                    <span class="${statClass(c.cpu_pct)}">${fmtPct(c.cpu_pct)}</span>
-                </div>
-                <div class="stat-pill">
-                    <span class="pill-label">GPU</span>
-                    <span class="${statClass(c.gpu_pct)}">${fmtPct(c.gpu_pct)}</span>
-                </div>
-                <div class="stat-pill">
-                    <span class="pill-label">RAM</span>
-                    <span class="${statClass(c.ram_pct)}">${fmtPct(c.ram_pct)}</span>
-                </div>
-                <div class="stat-pill">
-                    <span class="pill-label">Disk</span>
-                    <span class="${statClass(c.disk_pct)}">${fmtPct(c.disk_pct)}</span>
-                </div>
-            </div>
-            <div class="compute-meta">
-                ${c.cpu_temp != null ? `<span>CPU ${c.cpu_temp.toFixed(0)}°C</span>` : ''}
-                ${c.gpu_temp != null ? `<span>GPU ${c.gpu_temp.toFixed(0)}°C</span>` : ''}
-                ${c.power_mw != null ? `<span>${(c.power_mw/1000).toFixed(1)}W</span>` : ''}
-                <span>up ${fmtUptime(c.uptime_secs)}</span>
-                ${c.disk_used_gb != null ? `<span>${c.disk_used_gb}/${c.disk_total_gb}GB disk</span>` : ''}
-            </div>
-            ${dev.history.length > 1 ? `<div class="sparkline-wrap"><canvas id="${sparkId}"></canvas></div>` : ''}
-        </div>`;
-    });
+    // Build cards
+    const cards = devices.map(dev => renderDeviceCard(dev));
+    cards.push(renderVmCard(gcsVms));
 
-    el.innerHTML = `
-        <h2>Compute Fleet</h2>
-        <div class="accel-grid">${cards.join('')}</div>
-    `;
+    document.getElementById('fleet-grid').innerHTML =
+        `<div class="fleet-grid">${cards.join('')}</div>`;
 
-    // Draw sparklines after DOM update
+    // Render charts after DOM insert
     requestAnimationFrame(() => {
-        data.devices.forEach(dev => {
-            if (dev.online && dev.history.length > 1) {
-                renderDeviceSparkline(`spark-${dev.id}`, dev.history, dev.color);
+        devices.forEach(dev => {
+            if (dev.online && dev.history && dev.history.length > 1) {
+                renderDeviceChart('chart-' + dev.id, dev.history, dev);
             }
         });
     });
 }
 
+// -----------------------------------------------------------------------
+// API / Acceleration section (collapsible)
+// -----------------------------------------------------------------------
+
+function renderAccelCard(name, label, data, isCost) {
+    if (!data || !data.configured) {
+        return `<div class="accel-card not-configured">
+            <div class="provider"><span class="dot" style="background:${providerColor(name)}"></span>${label}</div>
+            <div class="config-hint">Not configured</div>
+        </div>`;
+    }
+    if (data.error && !data.token_metrics) {
+        return `<div class="accel-card">
+            <div class="provider"><span class="dot" style="background:${providerColor(name)}"></span>${label}</div>
+            <div class="error-msg">${data.error}</div>
+        </div>`;
+    }
+    const tm = data.token_metrics || {position:0, velocity:0, acceleration:0};
+    const cm = data.cost_metrics || {position:0, velocity:0, acceleration:0};
+    const m = isCost ? cm : tm;
+    const fmt = isCost ? fmtDollar : fmtNum;
+    return `<div class="accel-card">
+        <div class="provider"><span class="dot" style="background:${providerColor(name)}"></span>${label}</div>
+        <div class="metrics-row">
+            <div class="metric-box"><div class="label">Position</div><div class="value neutral">${fmt(m.position)}</div><div class="unit">${isCost ? 'total spend' : 'total tokens'}</div></div>
+            <div class="metric-box"><div class="label">Velocity</div><div class="value ${signClass(m.velocity)}">${signPrefix(m.velocity)}${fmt(m.velocity)}</div><div class="unit">7d avg/day</div></div>
+            <div class="metric-box accel-emphasis"><div class="label">Accel</div><div class="value ${signClass(m.acceleration)}">${signPrefix(m.acceleration)}${isCost ? fmtDollar(m.acceleration) : fmtNum(m.acceleration)}</div><div class="unit">5d &Delta;v</div></div>
+        </div>
+    </div>`;
+}
+
+function renderGcsCard(gcs) {
+    if (!gcs || !gcs.metrics) {
+        return `<div class="accel-card not-configured">
+            <div class="provider"><span class="dot" style="background:${providerColor('gcs')}"></span>Training Pipeline</div>
+            <div class="config-hint">No data</div>
+        </div>`;
+    }
+    const m = gcs.metrics;
+    return `<div class="accel-card">
+        <div class="provider"><span class="dot" style="background:${providerColor('gcs')}"></span>Training Pipeline</div>
+        <div class="metrics-row">
+            <div class="metric-box"><div class="label">Position</div><div class="value neutral">${fmtNum(m.position)}</div><div class="unit">sessions</div></div>
+            <div class="metric-box"><div class="label">Velocity</div><div class="value ${signClass(m.velocity)}">${signPrefix(m.velocity)}${fmtNum(m.velocity)}</div><div class="unit">7d avg/day</div></div>
+            <div class="metric-box accel-emphasis"><div class="label">Accel</div><div class="value ${signClass(m.acceleration)}">${signPrefix(m.acceleration)}${fmtNum(m.acceleration)}</div><div class="unit">5d &Delta;v</div></div>
+        </div>
+    </div>`;
+}
+
+function renderAccelTable(data) {
+    const rows = [];
+    for (const [name, label] of [['anthropic','Anthropic'],['openai','OpenAI'],['xai','xAI/Grok']]) {
+        const p = data.providers[name];
+        if (!p || !p.configured || !p.token_metrics) continue;
+        rows.push({name: label, color: providerColor(name), tm: p.token_metrics, cm: p.cost_metrics || {position:0,velocity:0,acceleration:0}});
+    }
+    if (data.gcs_pipeline?.metrics) {
+        rows.push({name:'GCS Pipeline', color: providerColor('gcs'), tm: data.gcs_pipeline.metrics, cm:{position:0,velocity:0,acceleration:0}});
+    }
+    if (!rows.length) return '';
+
+    let dailyHtml = '';
+    for (const r of rows) {
+        const last5 = (r.tm.daily || []).slice(-5);
+        if (!last5.length) continue;
+        dailyHtml += `<tr style="border-top:2px solid #2a2a4a"><td colspan="5" style="color:${r.color};font-weight:bold;padding-top:8px">${r.name}</td></tr>`;
+        for (const d of last5) {
+            dailyHtml += `<tr><td>${d.date}</td><td class="num">${fmtNum(d.value)}</td><td class="num">${fmtNum(d.cumulative)}</td><td class="num ${signClass(d.velocity)}">${signPrefix(d.velocity)}${fmtNum(d.velocity)}</td><td class="num ${signClass(d.acceleration)}">${signPrefix(d.acceleration)}${fmtNum(d.acceleration)}</td></tr>`;
+        }
+    }
+    return `<table class="accel-table"><thead><tr><th>Date</th><th class="num">Value</th><th class="num">Cumul</th><th class="num">Vel</th><th class="num">Accel</th></tr></thead><tbody>${dailyHtml}</tbody></table>`;
+}
+
+function renderChart(data) {
+    const colors = {anthropic:'#d4a574', openai:'#10b981', xai:'#60a5fa', gcs:'#a78bfa'};
+    let allDates = new Set();
+    for (const [name, p] of Object.entries(data.providers)) {
+        if (p.token_metrics?.daily) p.token_metrics.daily.forEach(d => allDates.add(d.date));
+    }
+    if (data.gcs_pipeline?.metrics?.daily) data.gcs_pipeline.metrics.daily.forEach(d => allDates.add(d.date));
+    allDates = [...allDates].sort();
+    if (!allDates.length) return '';
+    return `<div class="chart-section">
+        <div style="font-size:0.8em;color:#5c6bc0;font-weight:600;margin-bottom:10px">ACCELERATION OVER TIME</div>
+        <div class="chart-container"><canvas id="accelChart"></canvas></div>
+    </div>`;
+}
+
+function updateAccelChart(data) {
+    const canvas = document.getElementById('accelChart');
+    if (!canvas) return;
+    const colors = {anthropic:'#d4a574', openai:'#10b981', xai:'#60a5fa', gcs:'#a78bfa'};
+    let allDates = new Set();
+    const sources = [];
+    for (const [name, label] of [['anthropic','Anthropic'],['openai','OpenAI'],['xai','xAI']]) {
+        const p = data.providers[name];
+        if (!p?.token_metrics?.daily) continue;
+        p.token_metrics.daily.forEach(d => allDates.add(d.date));
+        sources.push({name, label, daily: p.token_metrics.daily, color: colors[name]});
+    }
+    if (data.gcs_pipeline?.metrics?.daily) {
+        data.gcs_pipeline.metrics.daily.forEach(d => allDates.add(d.date));
+        sources.push({name:'gcs', label:'GCS', daily: data.gcs_pipeline.metrics.daily, color: colors.gcs});
+    }
+    allDates = [...allDates].sort();
+    if (!allDates.length) return;
+
+    const datasets = sources.map(s => {
+        const dateMap = {};
+        s.daily.forEach(d => dateMap[d.date] = d.acceleration);
+        return {
+            label: s.label, data: allDates.map(d => dateMap[d] || 0),
+            borderColor: s.color, backgroundColor: s.color + '22',
+            borderWidth: 2, pointRadius: 3, pointBackgroundColor: s.color,
+            fill: true, tension: 0.3,
+        };
+    });
+
+    if (charts.accel) {
+        charts.accel.data.labels = allDates;
+        charts.accel.data.datasets = datasets;
+        charts.accel.update('none');
+        return;
+    }
+    charts.accel = new Chart(canvas, {
+        type: 'line',
+        data: { labels: allDates, datasets },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { labels: { color: '#888', font: { family: "'SF Mono', monospace", size: 10 } } },
+                tooltip: { backgroundColor: '#1a1a3a', titleColor: '#e0e0e0', bodyColor: '#bbb', borderColor: '#2a2a4a', borderWidth: 1 },
+            },
+            scales: {
+                x: { ticks: { color: '#555', font: { size: 9 } }, grid: { color: 'rgba(42,42,74,0.3)' } },
+                y: { title: { display: true, text: 'Accel (\u0394v)', color: '#5c6bc0', font: { size: 10 } }, ticks: { color: '#666', font: { size: 9 } }, grid: { color: 'rgba(42,42,74,0.3)' } },
+            },
+        },
+    });
+}
+
+function renderStatusBar(data) {
+    const pills = [];
+    for (const [name, label] of [['anthropic','Anthropic'],['openai','OpenAI'],['xai','xAI/Grok']]) {
+        const p = data.providers[name];
+        const dotClass = !p || !p.configured ? 'dot-gray' : p.error ? 'dot-red' : 'dot-green';
+        pills.push(`<div class="status-pill"><span class="dot ${dotClass}"></span>${label}</div>`);
+    }
+    const gcsOk = data.gcs_pipeline?.metrics?.position > 0;
+    pills.push(`<div class="status-pill"><span class="dot ${gcsOk ? 'dot-green' : 'dot-yellow'}"></span>GCS</div>`);
+    return `<div class="status-bar">${pills.join('')}</div>`;
+}
+
+function renderApiSection(data) {
+    const el = document.getElementById('api-section');
+    const collapsed = _apiSectionCollapsed;
+
+    el.innerHTML = `
+        <div class="collapsible-header ${collapsed ? 'collapsed' : ''}" onclick="toggleApiSection()">
+            <span class="arrow">\u25BE</span> API Usage & Acceleration
+        </div>
+        <div class="collapsible-body ${collapsed ? 'hidden' : ''}" id="api-body">
+            ${renderStatusBar(data)}
+
+            <div style="margin-top:12px;font-size:0.85em;color:#5c6bc0;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Tokens</div>
+            <div class="accel-grid">
+                ${renderAccelCard('anthropic', 'Anthropic', data.providers.anthropic, false)}
+                ${renderAccelCard('openai', 'OpenAI', data.providers.openai, false)}
+                ${renderAccelCard('xai', 'xAI', data.providers.xai, false)}
+                ${renderGcsCard(data.gcs_pipeline)}
+            </div>
+
+            <div style="margin-top:12px;font-size:0.85em;color:#5c6bc0;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Spend</div>
+            <div class="accel-grid">
+                ${renderAccelCard('anthropic', 'Anthropic', data.providers.anthropic, true)}
+                ${renderAccelCard('openai', 'OpenAI', data.providers.openai, true)}
+                ${renderAccelCard('xai', 'xAI', data.providers.xai, true)}
+            </div>
+
+            ${renderChart(data)}
+            ${renderAccelTable(data)}
+        </div>
+    `;
+
+    if (!collapsed) {
+        requestAnimationFrame(() => updateAccelChart(data));
+    }
+}
+
+function toggleApiSection() {
+    _apiSectionCollapsed = !_apiSectionCollapsed;
+    if (_lastApiData) renderApiSection(_lastApiData);
+}
+
+// -----------------------------------------------------------------------
+// Refresh loops
+// -----------------------------------------------------------------------
+
 async function fetchCompute() {
     try {
         const resp = await fetch('/api/compute');
-        const data = await resp.json();
-        renderComputeFleet(data);
+        _lastComputeData = await resp.json();
+        renderComputeFleet(_lastComputeData, _lastApiData);
+        document.getElementById('refresh-info').textContent =
+            'Fleet: ' + new Date().toLocaleTimeString() + ' (15s)';
     } catch (e) {
-        const el = document.getElementById('compute-fleet-section');
-        if (el) el.innerHTML = '';
+        console.error('Compute fetch error:', e);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main refresh
-// ---------------------------------------------------------------------------
-
-async function refresh() {
+async function fetchApi() {
     try {
         const resp = await fetch('/api/data');
-        const data = await resp.json();
-        render(data);
+        _lastApiData = await resp.json();
+        renderApiSection(_lastApiData);
+        // Re-render fleet too (for VMs)
+        if (_lastComputeData) renderComputeFleet(_lastComputeData, _lastApiData);
     } catch (e) {
-        document.getElementById('refresh-info').textContent = 'Error: ' + e.message;
+        console.error('API fetch error:', e);
     }
 }
 
-refresh();
+// Initial load
 fetchCompute();
-setInterval(refresh, 30000);
-setInterval(fetchCompute, 30000);
+fetchApi();
+
+// Compute fleet: 15s refresh, API data: 60s refresh
+setInterval(fetchCompute, 15000);
+setInterval(fetchApi, 60000);
 </script>
 </body>
 </html>"""
