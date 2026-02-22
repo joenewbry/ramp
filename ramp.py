@@ -1422,6 +1422,12 @@ function renderComputeFleet(computeData, apiData) {
     const cards = devices.map(dev => renderDeviceCard(dev));
     cards.push(renderVmCard(gcsVms));
 
+    // Destroy old chart instances before replacing DOM
+    Object.keys(computeCharts).forEach(k => {
+        computeCharts[k].destroy();
+        delete computeCharts[k];
+    });
+
     document.getElementById('fleet-grid').innerHTML =
         `<div class="fleet-grid">${cards.join('')}</div>`;
 

@@ -103,7 +103,7 @@ def detect_gpu_platform():
     # Check for nvidia-smi (desktop NVIDIA)
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=gpu_util.gpu", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             _gpu_platform = "nvidia-smi"
