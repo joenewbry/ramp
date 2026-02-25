@@ -121,37 +121,52 @@ def detect_gpu_platform():
 def parse_tegrastats() -> dict:
     """Run tegrastats once and parse the output line. Returns partial dict."""
     result = {}
+    line = ""
     try:
         proc = subprocess.run(
             ["tegrastats", "--interval", "100"],
             capture_output=True, text=True, timeout=1,
         )
         line = (proc.stdout or "").split("\n")[0]
-        if not line:
-            return result
+    except subprocess.TimeoutExpired as e:
+        # tegrastats is a streaming command — timeout is expected behavior.
+        # Grab whatever output was captured before the timeout.
+        output = e.stdout or e.output or b""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        line = output.strip().split("\n")[0]
+    except (FileNotFoundError, OSError):
+        return result
 
-        # GPU utilization: GR3D_FREQ 45%
-        m = re.search(r"GR3D_FREQ\s+(\d+)%", line)
-        if m:
-            result["gpu_pct"] = float(m.group(1))
+    if not line:
+        return result
 
-        # CPU temp: CPU@45.5C or CPU_TEMP 45C
+    # GPU utilization: GR3D_FREQ 45%
+    m = re.search(r"GR3D_FREQ\s+(\d+)%", line)
+    if m:
+        result["gpu_pct"] = float(m.group(1))
+
+    # CPU temp: cpu@49.5C or CPU@45.5C or CPU_TEMP 45C
+    m = re.search(r"cpu@([\d.]+)C", line, re.IGNORECASE)
+    if not m:
         m = re.search(r"CPU(?:_TEMP)?\s*[@:]?\s*([\d.]+)C", line)
-        if m:
-            result["cpu_temp"] = float(m.group(1))
+    if m:
+        result["cpu_temp"] = float(m.group(1))
 
-        # GPU temp: GPU@50C or GPU_TEMP 50C
+    # GPU temp: gpu@49.3C or GPU@50C or GPU_TEMP 50C
+    m = re.search(r"(?<!\w)gpu@([\d.]+)C", line, re.IGNORECASE)
+    if not m:
         m = re.search(r"GPU(?:_TEMP)?\s*[@:]?\s*([\d.]+)C", line)
-        if m:
-            result["gpu_temp"] = float(m.group(1))
+    if m:
+        result["gpu_temp"] = float(m.group(1))
 
-        # Power: VIN_SYS_5V0 5000mW
+    # Power: VDD_IN 6663mW/6663mW (Orin) or VIN_SYS_5V0 5000mW (older)
+    m = re.search(r"VDD_IN\s+(\d+)mW", line)
+    if not m:
         m = re.search(r"VIN_SYS_5V0\s+(\d+)mW", line)
-        if m:
-            result["power_mw"] = int(m.group(1))
+    if m:
+        result["power_mw"] = int(m.group(1))
 
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
     return result
 
 # ---------------------------------------------------------------------------
