@@ -27,7 +27,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import uvicorn
 
 # ---------------------------------------------------------------------------
@@ -63,14 +63,16 @@ DEFAULT_PORT = 8097
 STATS_DB_PATH = Path("/ssd/ramp/stats.db")
 
 KNOWN_DEVICES = [
-    {"id": "jetson-orin-nano",      "label": "Jetson Orin Nano",      "color": "#7c8aff",  "type": "jetson",      "alias": "Prometheus"},
-    {"id": "nvidia-dgx-spark",     "label": "NVIDIA DGX Spark",       "color": "#60a5fa",  "type": "dgx",         "alias": "Spark"},
+    {"id": "jetson-orin-nano",      "label": "Jetson Orin Nano",      "color": "#7c8aff",  "type": "jetson",      "alias": "Prometheus",   "ip": "192.168.0.18",  "user": "prometheus",  "password": "rising"},
+    {"id": "nvidia-dgx-spark",     "label": "NVIDIA DGX Spark",       "color": "#60a5fa",  "type": "dgx",         "alias": "Spark",        "ip": "192.168.0.234", "user": "macro",       "password": ""},
     {"id": "rtx4080-workstation",   "label": "RTX 4080 Workstation",   "color": "#a78bfa",  "type": "workstation", "alias": "Workstation"},
-    {"id": "orin-nano-2",           "label": "Orin Nano #2",           "color": "#34d399",  "type": "jetson",      "alias": "Orin-2"},
-    {"id": "orin-nano-3",           "label": "Orin Nano #3",           "color": "#fbbf24",  "type": "jetson",      "alias": "Orin-3"},
+    {"id": "atlas",                 "label": "Jetson Orin Nano Super", "color": "#34d399",  "type": "jetson",      "alias": "Atlas",        "ip": "192.168.0.66",  "user": "atlas",       "password": "shrugged"},
+    {"id": "epimetheus",            "label": "Jetson Orin Nano Super", "color": "#fbbf24",  "type": "jetson",      "alias": "Epimetheus",   "ip": "192.168.0.202", "user": "epimetheus",  "password": "reflecting"},
 ]
 
-app = FastAPI(title="Ramp Dashboard", version="0.1.0")
+APP_VERSION = Path("VERSION").read_text().strip() if Path("VERSION").exists() else "dev"
+
+app = FastAPI(title="Ramp Dashboard", version=APP_VERSION)
 
 # ---------------------------------------------------------------------------
 # Cache
@@ -688,9 +690,14 @@ async def ingest_stats(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/VERSION", response_class=PlainTextResponse)
+async def version_file():
+    return APP_VERSION
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return DASHBOARD_HTML
+    return DASHBOARD_HTML.replace("__VERSION__", APP_VERSION)
 
 
 # ---------------------------------------------------------------------------
@@ -1672,6 +1679,7 @@ fetchApi();
 setInterval(fetchCompute, 15000);
 setInterval(fetchApi, 60000);
 </script>
+<div id="dsl-version" style="position:fixed;bottom:8px;right:8px;font-family:'SF Mono',Consolas,monospace;font-size:11px;color:rgba(255,255,255,0.35);background:rgba(0,0,0,0.25);padding:2px 8px;border-radius:4px;pointer-events:none;z-index:9998;letter-spacing:0.5px">__VERSION__</div>
 </body>
 </html>"""
 
