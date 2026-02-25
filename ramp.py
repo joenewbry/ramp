@@ -66,8 +66,8 @@ KNOWN_DEVICES = [
     {"id": "jetson-orin-nano",      "label": "Jetson Orin Nano",      "color": "#7c8aff",  "type": "jetson",      "alias": "Prometheus",   "ip": "192.168.0.18",  "user": "prometheus",  "password": "rising"},
     {"id": "nvidia-dgx-spark",     "label": "NVIDIA DGX Spark",       "color": "#60a5fa",  "type": "dgx",         "alias": "Spark",        "ip": "192.168.0.234", "user": "macro",       "password": ""},
     {"id": "rtx4080-workstation",   "label": "RTX 4080 Workstation",   "color": "#a78bfa",  "type": "workstation", "alias": "Workstation"},
-    {"id": "atlas",                 "label": "Jetson Orin Nano Super", "color": "#34d399",  "type": "jetson",      "alias": "Atlas",        "ip": "192.168.0.101",  "user": "atlas",       "password": "shrugged"},
-    {"id": "epimetheus",            "label": "Jetson Orin Nano Super", "color": "#fbbf24",  "type": "jetson",      "alias": "Epimetheus",   "ip": "192.168.0.202", "user": "epimetheus",  "password": "reflecting"},
+    {"id": "atlas",                 "label": "Jetson Orin Nano Super", "color": "#34d399",  "type": "jetson",      "alias": "Atlas",        "ip": "192.168.0.101",  "user": "atlas",       "password": "shrugged",   "legacy_ids": ["orin-2", "orin-nano-2"]},
+    {"id": "epimetheus",            "label": "Jetson Orin Nano Super", "color": "#fbbf24",  "type": "jetson",      "alias": "Epimetheus",   "ip": "192.168.0.202", "user": "epimetheus",  "password": "reflecting", "legacy_ids": ["orin-3", "orin-nano-3"]},
 ]
 
 APP_VERSION = Path("VERSION").read_text().strip() if Path("VERSION").exists() else "dev"
@@ -456,9 +456,12 @@ def fetch_compute_stats() -> dict:
 
             for dev in KNOWN_DEVICES:
                 did = dev["id"]
+                candidate_ids = [did, *(dev.get("legacy_ids") or [])]
+                placeholders = ",".join(["?"] * len(candidate_ids))
                 row = conn.execute(
-                    "SELECT * FROM device_stats WHERE device_id=? ORDER BY timestamp DESC LIMIT 1",
-                    (did,),
+                    f"SELECT * FROM device_stats WHERE device_id IN ({placeholders}) "
+                    "ORDER BY timestamp DESC LIMIT 1",
+                    tuple(candidate_ids),
                 ).fetchone()
                 current = dict(row) if row else None
 
@@ -468,8 +471,8 @@ def fetch_compute_stats() -> dict:
                 history_rows = conn.execute(
                     "SELECT timestamp, cpu_pct, gpu_pct, ram_pct, cpu_temp, gpu_temp, power_mw "
                     "FROM device_stats "
-                    "WHERE device_id=? AND timestamp > ? ORDER BY timestamp ASC",
-                    (did, cutoff_24h),
+                    f"WHERE device_id IN ({placeholders}) AND timestamp > ? ORDER BY timestamp ASC",
+                    tuple(candidate_ids) + (cutoff_24h,),
                 ).fetchall()
                 history = [{"ts": r["timestamp"], "cpu": r["cpu_pct"], "gpu": r["gpu_pct"],
                             "ram": r["ram_pct"], "cpu_temp": r["cpu_temp"],
@@ -481,8 +484,8 @@ def fetch_compute_stats() -> dict:
                 try:
                     proc_rows = conn.execute(
                         "SELECT name, cpu_pct, mem_pct, kind FROM device_processes "
-                        "WHERE device_id=? ORDER BY snapshot_ts DESC, cpu_pct DESC LIMIT 10",
-                        (did,),
+                        f"WHERE device_id IN ({placeholders}) ORDER BY snapshot_ts DESC, cpu_pct DESC LIMIT 10",
+                        tuple(candidate_ids),
                     ).fetchall()
                     processes = [{"name": r["name"], "cpu": r["cpu_pct"],
                                   "mem": r["mem_pct"], "kind": r["kind"]}
@@ -495,8 +498,8 @@ def fetch_compute_stats() -> dict:
                 try:
                     disk_rows = conn.execute(
                         "SELECT mount, label, used_gb, total_gb, pct FROM device_disks "
-                        "WHERE device_id=? ORDER BY snapshot_ts DESC, total_gb DESC",
-                        (did,),
+                        f"WHERE device_id IN ({placeholders}) ORDER BY snapshot_ts DESC, total_gb DESC",
+                        tuple(candidate_ids),
                     ).fetchall()
                     disks = [{"mount": r["mount"], "label": r["label"],
                               "used_gb": r["used_gb"], "total_gb": r["total_gb"],
@@ -511,6 +514,7 @@ def fetch_compute_stats() -> dict:
                     "color": dev["color"],
                     "type": dev["type"],
                     "alias": dev["alias"],
+                    "ip": dev.get("ip"),
                     "online": online,
                     "current": current,
                     "history": history,
@@ -522,7 +526,7 @@ def fetch_compute_stats() -> dict:
             for dev in KNOWN_DEVICES:
                 devices.append({"id": dev["id"], "label": dev["label"],
                                  "color": dev["color"], "type": dev["type"],
-                                 "alias": dev["alias"], "online": False,
+                                 "alias": dev["alias"], "ip": dev.get("ip"), "online": False,
                                  "current": None, "history": [], "processes": [],
                                  "disks": [], "error": str(e)})
 
@@ -1214,13 +1218,14 @@ function renderUtilBar(label, pct) {
 // -----------------------------------------------------------------------
 
 function renderDeviceCard(dev) {
+    const subtitle = `${dev.label}${dev.ip ? ` · ${dev.ip}` : ''}`;
     if (!dev.online || !dev.current) {
         return `<div class="dev-card offline">
             <div class="dev-header">
                 <span class="online-dot off"></span>
                 <span class="dev-alias" style="color:${dev.color}">${dev.alias || dev.label}</span>
             </div>
-            <div class="dev-type">${dev.label}</div>
+            <div class="dev-type">${subtitle}</div>
             <div style="color:#444;font-size:0.85em;margin-top:16px;text-align:center">OFFLINE</div>
         </div>`;
     }
@@ -1250,7 +1255,7 @@ function renderDeviceCard(dev) {
             <span class="online-dot on"></span>
             <span class="dev-alias" style="color:${dev.color}">${dev.alias || dev.label}</span>
         </div>
-        <div class="dev-type">${dev.label}</div>
+        <div class="dev-type">${subtitle}</div>
 
         <div class="util-bars">
             ${renderUtilBar('CPU', c.cpu_pct)}
