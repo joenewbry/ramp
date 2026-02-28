@@ -76,6 +76,15 @@ def init_db(conn):
             pct REAL
         );
         CREATE INDEX IF NOT EXISTS idx_disk_ts ON device_disks (device_id, snapshot_ts);
+        CREATE TABLE IF NOT EXISTS device_network (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            interface TEXT NOT NULL,
+            rx_bytes INTEGER NOT NULL,
+            tx_bytes INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_net_ts ON device_network (device_id, timestamp);
     """)
     conn.commit()
 
@@ -346,6 +355,25 @@ def collect() -> dict:
     elif platform == "nvidia-smi":
         row.update(parse_nvidia_smi())
 
+    # Network counters (cumulative bytes per interface)
+    SKIP_IFACES = {"lo", "docker0", "br-", "veth", "virbr"}
+    try:
+        net = psutil.net_io_counters(pernic=True)
+        counters = []
+        for iface, c in net.items():
+            if any(iface.startswith(s) for s in SKIP_IFACES):
+                continue
+            if c.bytes_recv < 1_000_000:  # skip interfaces with <1MB received
+                continue
+            counters.append({
+                "interface": iface,
+                "rx_bytes": c.bytes_recv,
+                "tx_bytes": c.bytes_sent,
+            })
+        row["net_counters"] = counters
+    except Exception:
+        row["net_counters"] = []
+
     return row
 
 # ---------------------------------------------------------------------------
@@ -409,8 +437,9 @@ def main():
                 ok = push_data(row, processes)
                 status = "pushed" if ok else "push-failed"
             else:
-                # Build stats row without disks array (stored separately)
-                stats_row = {k: v for k, v in row.items() if k != "disks"}
+                # Build stats row without extra arrays (stored separately)
+                stats_row = {k: v for k, v in row.items()
+                             if k not in ("disks", "net_counters")}
                 conn.execute(
                     """INSERT INTO device_stats
                        (timestamp, device_id, cpu_pct, gpu_pct,
@@ -452,6 +481,16 @@ def main():
                             (ts, DEVICE_ID, dk["mount"], dk.get("label", dk["mount"]),
                              dk["used_gb"], dk["total_gb"], dk["pct"]),
                         )
+                # Insert network counters
+                for nc in row.get("net_counters", []):
+                    conn.execute(
+                        """INSERT INTO device_network
+                           (timestamp, device_id, interface, rx_bytes, tx_bytes)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (ts, DEVICE_ID, nc["interface"],
+                         nc["rx_bytes"], nc["tx_bytes"]),
+                    )
+
                 conn.commit()
 
                 # Prune rows older than PRUNE_DAYS
@@ -459,6 +498,7 @@ def main():
                 conn.execute("DELETE FROM device_stats WHERE timestamp < ?", (cutoff,))
                 conn.execute("DELETE FROM device_processes WHERE snapshot_ts < ?", (cutoff,))
                 conn.execute("DELETE FROM device_disks WHERE snapshot_ts < ?", (cutoff,))
+                conn.execute("DELETE FROM device_network WHERE timestamp < ?", (cutoff,))
                 conn.commit()
                 status = "written"
 

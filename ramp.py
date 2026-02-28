@@ -536,8 +536,132 @@ def fetch_compute_stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Network stats
+# ---------------------------------------------------------------------------
+
+def fetch_network_stats() -> dict:
+    """Compute per-device daily network usage from cumulative byte counters."""
+    def _fetch():
+        if not STATS_DB_PATH.exists():
+            return {"devices": []}
+
+        try:
+            conn = sqlite3.connect(str(STATS_DB_PATH))
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.row_factory = sqlite3.Row
+            cutoff = int(time.time()) - (14 * 86400)
+
+            results = []
+            for dev in KNOWN_DEVICES:
+                did = dev["id"]
+                candidate_ids = [did, *(dev.get("legacy_ids") or [])]
+                placeholders = ",".join(["?"] * len(candidate_ids))
+
+                rows = conn.execute(
+                    f"""SELECT timestamp, interface, rx_bytes, tx_bytes
+                        FROM device_network
+                        WHERE device_id IN ({placeholders}) AND timestamp > ?
+                        ORDER BY interface, timestamp ASC""",
+                    tuple(candidate_ids) + (cutoff,),
+                ).fetchall()
+
+                if not rows:
+                    continue
+
+                # Group by interface
+                by_iface = {}
+                for r in rows:
+                    iface = r["interface"]
+                    if iface not in by_iface:
+                        by_iface[iface] = []
+                    by_iface[iface].append({
+                        "ts": r["timestamp"],
+                        "rx": r["rx_bytes"],
+                        "tx": r["tx_bytes"],
+                    })
+
+                # Compute deltas and bucket into days
+                daily = {}  # date_str -> {rx, tx}
+                total_rx = 0
+                total_tx = 0
+                last_pair_gap = None
+                last_pair_rx_rate = 0
+                last_pair_tx_rate = 0
+
+                for iface, readings in by_iface.items():
+                    for i in range(1, len(readings)):
+                        prev = readings[i - 1]
+                        curr = readings[i]
+                        dt = curr["ts"] - prev["ts"]
+                        if dt <= 0:
+                            continue
+
+                        drx = curr["rx"] - prev["rx"]
+                        dtx = curr["tx"] - prev["tx"]
+
+                        # Counter reset (reboot): use current value as delta
+                        if drx < 0:
+                            drx = curr["rx"]
+                        if dtx < 0:
+                            dtx = curr["tx"]
+
+                        day = datetime.fromtimestamp(curr["ts"], tz=timezone.utc).strftime("%Y-%m-%d")
+                        if day not in daily:
+                            daily[day] = {"rx": 0, "tx": 0}
+                        daily[day]["rx"] += drx
+                        daily[day]["tx"] += dtx
+                        total_rx += drx
+                        total_tx += dtx
+
+                        # Track most recent pair for current rate
+                        if last_pair_gap is None or curr["ts"] > readings[i - 1]["ts"]:
+                            last_pair_gap = dt
+                            last_pair_rx_rate = drx / dt if dt > 0 else 0
+                            last_pair_tx_rate = dtx / dt if dt > 0 else 0
+
+                # Sort daily into list
+                daily_list = [{"date": d, "rx": daily[d]["rx"], "tx": daily[d]["tx"]}
+                              for d in sorted(daily.keys())]
+
+                # Today's totals
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                today_data = daily.get(today, {"rx": 0, "tx": 0})
+
+                # Current rate — only show if last reading gap <= 5 minutes
+                rate_rx = 0
+                rate_tx = 0
+                if last_pair_gap is not None and last_pair_gap <= 300:
+                    rate_rx = last_pair_rx_rate
+                    rate_tx = last_pair_tx_rate
+
+                results.append({
+                    "id": did,
+                    "alias": dev["alias"],
+                    "color": dev["color"],
+                    "today_rx": today_data["rx"],
+                    "today_tx": today_data["tx"],
+                    "rate_rx": rate_rx,
+                    "rate_tx": rate_tx,
+                    "daily": daily_list,
+                })
+
+            conn.close()
+            return {"devices": results}
+        except Exception as e:
+            return {"devices": [], "error": str(e)}
+
+    return cached("network", _fetch, ttl=30)
+
+
+# ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/api/network")
+async def api_network():
+    """Per-device network traffic — daily totals and current rates."""
+    return JSONResponse(fetch_network_stats())
+
 
 @app.get("/api/data")
 async def api_data():
@@ -600,6 +724,15 @@ def _ensure_ingest_tables(conn):
             pct REAL
         );
         CREATE INDEX IF NOT EXISTS idx_disk_ts ON device_disks (device_id, snapshot_ts);
+        CREATE TABLE IF NOT EXISTS device_network (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            interface TEXT NOT NULL,
+            rx_bytes INTEGER NOT NULL,
+            tx_bytes INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_net_ts ON device_network (device_id, timestamp);
     """)
     conn.commit()
 
@@ -682,12 +815,24 @@ async def ingest_stats(request: Request):
                      dk.get("pct", 0)),
                 )
 
+        # Insert network counters if provided
+        net_counters = body.get("net_counters", [])
+        for nc in net_counters:
+            conn.execute(
+                """INSERT INTO device_network
+                   (timestamp, device_id, interface, rx_bytes, tx_bytes)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (ts, device_id, nc.get("interface", "?"),
+                 nc.get("rx_bytes", 0), nc.get("tx_bytes", 0)),
+            )
+
         conn.commit()
         conn.close()
 
-        # Invalidate compute cache so next fetch picks up new data
+        # Invalidate caches so next fetch picks up new data
         with _cache_lock:
             _cache.pop("compute", None)
+            _cache.pop("network", None)
 
         return JSONResponse({"status": "ok", "device_id": device_id})
     except Exception as e:
@@ -1113,6 +1258,60 @@ h1 span { color: #ff6b6b; font-weight: 400; }
 .dot-red { background: #f87171; }
 .dot-yellow { background: #fbbf24; }
 .dot-gray { background: #555; }
+
+/* Network traffic section */
+.net-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+}
+.net-card {
+    background: linear-gradient(135deg, #0e0e22 0%, #141430 100%);
+    border: 1px solid #2a2a4a;
+    border-radius: 10px;
+    padding: 16px 18px;
+}
+.net-card .net-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.net-card .net-alias {
+    font-size: 1em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.net-stat {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.82em;
+    padding: 3px 0;
+}
+.net-stat .net-label { color: #888; }
+.net-stat .net-val { font-weight: 700; font-variant-numeric: tabular-nums; }
+.net-rate {
+    font-size: 0.75em;
+    color: #666;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid #1a1a3a;
+}
+.net-chart-wrap {
+    height: 120px;
+    position: relative;
+    margin-top: 10px;
+}
+.net-today-badge {
+    font-size: 0.82em;
+    color: #888;
+    margin-left: auto;
+    font-weight: 400;
+}
+.net-today-badge .val { font-weight: 700; color: #e0e0e0; }
 </style>
 </head>
 <body>
@@ -1126,14 +1325,18 @@ h1 span { color: #ff6b6b; font-weight: 400; }
 
 <div id="fleet-summary"></div>
 <div id="fleet-grid"></div>
+<div id="network-section"></div>
 <div id="api-section"></div>
 
 <script>
 let charts = {};
 let computeCharts = {};
+let networkCharts = {};
 let _lastApiData = null;
 let _lastComputeData = null;
+let _lastNetworkData = null;
 let _apiSectionCollapsed = true;
+let _networkSectionCollapsed = false;
 
 // -----------------------------------------------------------------------
 // Formatters
@@ -1164,6 +1367,22 @@ function fmtUptime(secs) {
     if (d > 0) return d + 'd ' + h + 'h';
     if (h > 0) return h + 'h ' + m + 'm';
     return m + 'm';
+}
+
+function fmtBytes(b) {
+    if (typeof b !== 'number' || isNaN(b) || b === 0) return '0 B';
+    if (b >= 1e12) return (b / 1e12).toFixed(1) + ' TB';
+    if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
+    if (b >= 1e6) return (b / 1e6).toFixed(0) + ' MB';
+    if (b >= 1e3) return (b / 1e3).toFixed(0) + ' KB';
+    return b + ' B';
+}
+function fmtRate(bps) {
+    if (typeof bps !== 'number' || isNaN(bps) || bps === 0) return '0 B/s';
+    if (bps >= 1e9) return (bps / 1e9).toFixed(1) + ' GB/s';
+    if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' MB/s';
+    if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' KB/s';
+    return bps.toFixed(0) + ' B/s';
 }
 
 function utilColor(pct) {
@@ -1649,6 +1868,159 @@ function toggleApiSection() {
 }
 
 // -----------------------------------------------------------------------
+// Network traffic section
+// -----------------------------------------------------------------------
+
+function renderNetworkCard(dev) {
+    const chartId = 'net-chart-' + dev.id;
+    const todayTotal = dev.today_rx + dev.today_tx;
+    return `<div class="net-card">
+        <div class="net-header">
+            <span class="net-alias" style="color:${dev.color}">${dev.alias}</span>
+        </div>
+        <div class="net-stat">
+            <span class="net-label">\u2193 Received</span>
+            <span class="net-val" style="color:${dev.color}">${fmtBytes(dev.today_rx)}</span>
+        </div>
+        <div class="net-stat">
+            <span class="net-label">\u2191 Sent</span>
+            <span class="net-val" style="color:#f87171">${fmtBytes(dev.today_tx)}</span>
+        </div>
+        <div class="net-stat">
+            <span class="net-label">Total</span>
+            <span class="net-val">${fmtBytes(todayTotal)}</span>
+        </div>
+        <div class="net-rate">\u2193${fmtRate(dev.rate_rx)} / \u2191${fmtRate(dev.rate_tx)}</div>
+        ${dev.daily && dev.daily.length > 1 ? `<div class="net-chart-wrap"><canvas id="${chartId}"></canvas></div>` : ''}
+    </div>`;
+}
+
+function renderNetworkChart(canvasId, daily, dev) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || !daily || daily.length < 2) return;
+
+    const labels = daily.map(d => d.date.slice(5)); // MM-DD
+    const rxData = daily.map(d => d.rx / 1e9); // GB
+    const txData = daily.map(d => d.tx / 1e9);
+
+    const datasets = [
+        {
+            label: 'RX',
+            data: rxData,
+            backgroundColor: dev.color + 'aa',
+            borderColor: dev.color,
+            borderWidth: 1,
+        },
+        {
+            label: 'TX',
+            data: txData,
+            backgroundColor: '#f87171aa',
+            borderColor: '#f87171',
+            borderWidth: 1,
+        },
+    ];
+
+    if (networkCharts[canvasId]) {
+        networkCharts[canvasId].data.labels = labels;
+        networkCharts[canvasId].data.datasets = datasets;
+        networkCharts[canvasId].update('none');
+        return;
+    }
+
+    networkCharts[canvasId] = new Chart(canvas, {
+        type: 'bar',
+        data: { labels, datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                    labels: { color: '#666', font: { size: 9 }, boxWidth: 10, padding: 4 },
+                },
+                tooltip: {
+                    backgroundColor: '#1a1a3a',
+                    titleColor: '#e0e0e0',
+                    bodyColor: '#bbb',
+                    borderColor: '#2a2a4a',
+                    borderWidth: 1,
+                    callbacks: {
+                        label: function(ctx) {
+                            return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(2) + ' GB';
+                        }
+                    }
+                },
+            },
+            scales: {
+                x: {
+                    stacked: true,
+                    ticks: { color: '#444', font: { size: 8 }, maxRotation: 0 },
+                    grid: { display: false },
+                },
+                y: {
+                    stacked: true,
+                    ticks: {
+                        color: '#555',
+                        font: { size: 8 },
+                        callback: function(v) { return v.toFixed(1) + ' GB'; }
+                    },
+                    grid: { color: 'rgba(42,42,74,0.2)' },
+                },
+            },
+            animation: false,
+        },
+    });
+}
+
+function renderNetworkSection(data) {
+    const el = document.getElementById('network-section');
+    const devices = data?.devices || [];
+    if (!devices.length) {
+        el.innerHTML = '';
+        return;
+    }
+
+    const collapsed = _networkSectionCollapsed;
+
+    // Fleet-wide today total
+    const todayTotal = devices.reduce((s, d) => s + d.today_rx + d.today_tx, 0);
+
+    // Destroy old charts before DOM replace
+    Object.keys(networkCharts).forEach(k => {
+        networkCharts[k].destroy();
+        delete networkCharts[k];
+    });
+
+    const cards = devices.map(d => renderNetworkCard(d)).join('');
+
+    el.innerHTML = `
+        <div class="collapsible-header ${collapsed ? 'collapsed' : ''}" onclick="toggleNetworkSection()">
+            <span class="arrow">\u25BE</span> Network Traffic
+            <span class="net-today-badge">Today: <span class="val">${fmtBytes(todayTotal)}</span></span>
+        </div>
+        <div class="collapsible-body ${collapsed ? 'hidden' : ''}" id="network-body">
+            <div class="net-grid">${cards}</div>
+        </div>
+    `;
+
+    if (!collapsed) {
+        requestAnimationFrame(() => {
+            devices.forEach(dev => {
+                if (dev.daily && dev.daily.length > 1) {
+                    renderNetworkChart('net-chart-' + dev.id, dev.daily, dev);
+                }
+            });
+        });
+    }
+}
+
+function toggleNetworkSection() {
+    _networkSectionCollapsed = !_networkSectionCollapsed;
+    if (_lastNetworkData) renderNetworkSection(_lastNetworkData);
+}
+
+// -----------------------------------------------------------------------
 // Refresh loops
 // -----------------------------------------------------------------------
 
@@ -1676,13 +2048,25 @@ async function fetchApi() {
     }
 }
 
+async function fetchNetwork() {
+    try {
+        const resp = await fetch('/api/network');
+        _lastNetworkData = await resp.json();
+        renderNetworkSection(_lastNetworkData);
+    } catch (e) {
+        console.error('Network fetch error:', e);
+    }
+}
+
 // Initial load
 fetchCompute();
 fetchApi();
+fetchNetwork();
 
-// Compute fleet: 15s refresh, API data: 60s refresh
+// Compute fleet: 15s refresh, API data: 60s refresh, Network: 30s refresh
 setInterval(fetchCompute, 15000);
 setInterval(fetchApi, 60000);
+setInterval(fetchNetwork, 30000);
 </script>
 <div id="dsl-version" style="position:fixed;bottom:8px;right:8px;font-family:'SF Mono',Consolas,monospace;font-size:11px;color:rgba(255,255,255,0.35);background:rgba(0,0,0,0.25);padding:2px 8px;border-radius:4px;pointer-events:none;z-index:9998;letter-spacing:0.5px">__VERSION__</div>
 </body>
