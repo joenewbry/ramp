@@ -92,6 +92,83 @@ def cached(key: str, fn, ttl: int = 60):
         _cache[key] = (result, time.time())
     return result
 
+
+# ---------------------------------------------------------------------------
+# SSH helpers for remote device polling
+# ---------------------------------------------------------------------------
+
+def _ssh_cmd(device: dict, cmd: str) -> str | None:
+    """Run a command on a remote device via SSH. Returns stdout or None."""
+    ip = device.get("ip")
+    user = device.get("user")
+    if not ip or not user:
+        return None
+
+    ssh_opts = [
+        "-o", "ConnectTimeout=5",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "BatchMode=yes",
+    ]
+    target = f"{user}@{ip}"
+
+    # Try key-based auth first
+    try:
+        result = subprocess.run(
+            ["ssh", *ssh_opts, target, cmd],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Fall back to sshpass if password is set
+    pw = device.get("password")
+    if pw:
+        try:
+            result = subprocess.run(
+                ["sshpass", f"-p{pw}", "ssh",
+                 "-o", "ConnectTimeout=5",
+                 "-o", "StrictHostKeyChecking=no",
+                 target, cmd],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    return None
+
+
+_SKIP_IFACES = {"lo", "docker0", "br-", "veth", "virbr"}
+
+
+def _parse_proc_net_dev(text: str) -> list[dict]:
+    """Parse /proc/net/dev output into [{interface, rx_bytes, tx_bytes}, ...]."""
+    results = []
+    for line in text.strip().splitlines():
+        if ":" not in line:
+            continue
+        iface_part, stats_part = line.split(":", 1)
+        iface = iface_part.strip()
+        if any(iface.startswith(s) for s in _SKIP_IFACES):
+            continue
+        cols = stats_part.split()
+        if len(cols) < 10:
+            continue
+        rx_bytes = int(cols[0])
+        tx_bytes = int(cols[8])
+        if rx_bytes < 1_000_000:  # skip interfaces with <1MB received
+            continue
+        results.append({
+            "interface": iface,
+            "rx_bytes": rx_bytes,
+            "tx_bytes": tx_bytes,
+        })
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Velocity / Acceleration math
 # ---------------------------------------------------------------------------
@@ -646,11 +723,95 @@ def fetch_network_stats() -> dict:
                 })
 
             conn.close()
+
+            # Fleet roll-up: aggregate all devices into a total card
+            if len(results) > 1:
+                fleet_daily = {}  # date -> {rx, tx}
+                fleet_today_rx = 0
+                fleet_today_tx = 0
+                fleet_rate_rx = 0
+                fleet_rate_tx = 0
+                for r in results:
+                    fleet_today_rx += r["today_rx"]
+                    fleet_today_tx += r["today_tx"]
+                    fleet_rate_rx += r["rate_rx"]
+                    fleet_rate_tx += r["rate_tx"]
+                    for d in r["daily"]:
+                        if d["date"] not in fleet_daily:
+                            fleet_daily[d["date"]] = {"rx": 0, "tx": 0}
+                        fleet_daily[d["date"]]["rx"] += d["rx"]
+                        fleet_daily[d["date"]]["tx"] += d["tx"]
+
+                fleet_daily_list = [{"date": d, "rx": fleet_daily[d]["rx"],
+                                     "tx": fleet_daily[d]["tx"]}
+                                    for d in sorted(fleet_daily.keys())]
+                results.insert(0, {
+                    "id": "_total",
+                    "alias": "Fleet Total",
+                    "color": "#ffffff",
+                    "today_rx": fleet_today_rx,
+                    "today_tx": fleet_today_tx,
+                    "rate_rx": fleet_rate_rx,
+                    "rate_tx": fleet_rate_tx,
+                    "daily": fleet_daily_list,
+                    "is_total": True,
+                })
+
             return {"devices": results}
         except Exception as e:
             return {"devices": [], "error": str(e)}
 
     return cached("network", _fetch, ttl=30)
+
+
+# ---------------------------------------------------------------------------
+# Remote network polling (SSH-based)
+# ---------------------------------------------------------------------------
+
+_poll_shutdown = threading.Event()
+
+
+def _poll_remote_network():
+    """Background thread: SSH into remote devices, read /proc/net/dev, insert into DB."""
+    # Devices with IP set, excluding Prometheus (has local stats_collector)
+    targets = [d for d in KNOWN_DEVICES if d.get("ip") and d["id"] != "jetson-orin-nano"]
+
+    while not _poll_shutdown.is_set():
+        for dev in targets:
+            try:
+                output = _ssh_cmd(dev, "cat /proc/net/dev")
+                if not output:
+                    continue
+
+                counters = _parse_proc_net_dev(output)
+                if not counters:
+                    continue
+
+                ts = int(time.time())
+                conn = sqlite3.connect(str(STATS_DB_PATH))
+                conn.execute("PRAGMA journal_mode=WAL")
+                for nc in counters:
+                    conn.execute(
+                        """INSERT INTO device_network
+                           (timestamp, device_id, interface, rx_bytes, tx_bytes)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (ts, dev["id"], nc["interface"],
+                         nc["rx_bytes"], nc["tx_bytes"]),
+                    )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass  # silently skip unreachable devices
+
+        # Invalidate network cache after a polling round
+        with _cache_lock:
+            _cache.pop("network", None)
+
+        # Sleep in 1s increments for graceful shutdown
+        for _ in range(60):
+            if _poll_shutdown.is_set():
+                break
+            time.sleep(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1433,10 @@ h1 span { color: #ff6b6b; font-weight: 400; }
     border-radius: 10px;
     padding: 16px 18px;
 }
+.net-card.net-total {
+    border: 2px solid rgba(255,255,255,0.25);
+    background: linear-gradient(135deg, #12122e 0%, #1a1a3e 100%);
+}
 .net-card .net-header {
     display: flex;
     align-items: center;
@@ -1874,7 +2039,8 @@ function toggleApiSection() {
 function renderNetworkCard(dev) {
     const chartId = 'net-chart-' + dev.id;
     const todayTotal = dev.today_rx + dev.today_tx;
-    return `<div class="net-card">
+    const totalCls = dev.is_total ? ' net-total' : '';
+    return `<div class="net-card${totalCls}">
         <div class="net-header">
             <span class="net-alias" style="color:${dev.color}">${dev.alias}</span>
         </div>
@@ -2081,5 +2247,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ramp — Acceleration Dashboard")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
+
+    # Start remote network polling thread
+    threading.Thread(target=_poll_remote_network, daemon=True).start()
+
     print(f"Ramp Dashboard: http://localhost:{args.port}")
     uvicorn.run(app, host="0.0.0.0", port=args.port)
