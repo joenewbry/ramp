@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sqlite3
@@ -26,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import uvicorn
 
@@ -97,7 +98,7 @@ def cached(key: str, fn, ttl: int = 60):
 # SSH helpers for remote device polling
 # ---------------------------------------------------------------------------
 
-def _ssh_cmd(device: dict, cmd: str) -> str | None:
+def _ssh_cmd(device: dict, cmd: str, timeout: int = 10) -> str | None:
     """Run a command on a remote device via SSH. Returns stdout or None."""
     ip = device.get("ip")
     user = device.get("user")
@@ -115,7 +116,7 @@ def _ssh_cmd(device: dict, cmd: str) -> str | None:
     try:
         result = subprocess.run(
             ["ssh", *ssh_opts, target, cmd],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode == 0:
             return result.stdout
@@ -131,13 +132,38 @@ def _ssh_cmd(device: dict, cmd: str) -> str | None:
                  "-o", "ConnectTimeout=5",
                  "-o", "StrictHostKeyChecking=no",
                  target, cmd],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=timeout,
             )
             if result.returncode == 0:
                 return result.stdout
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
+    return None
+
+
+def _local_or_ssh_cmd(device: dict, cmd: str, timeout: int = 10) -> str | None:
+    """Run locally for Prometheus (where dashboard runs), SSH for others."""
+    if device["id"] == "jetson-orin-nano":
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout,
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return None
+    return _ssh_cmd(device, cmd, timeout=timeout)
+
+
+def _find_device(device_id: str) -> dict | None:
+    """Look up a device by ID or legacy ID."""
+    for d in KNOWN_DEVICES:
+        if d["id"] == device_id:
+            return d
+        if device_id in d.get("legacy_ids", []):
+            return d
     return None
 
 
@@ -1000,6 +1026,87 @@ async def ingest_stats(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ---------------------------------------------------------------------------
+# Log viewer API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/logs/{device_id}")
+async def get_logs(
+    device_id: str,
+    lines: int = Query(100, ge=1, le=500),
+    service: str | None = Query(None),
+    since: str | None = Query(None),
+):
+    dev = _find_device(device_id)
+    if not dev:
+        return JSONResponse({"error": "Unknown device"}, status_code=404)
+    if not dev.get("ip"):
+        return JSONResponse({"error": "Device has no IP"}, status_code=400)
+
+    def _fetch():
+        parts = ["journalctl", "--no-pager", "-o", "short-iso"]
+        if service:
+            parts += ["-u", service]
+        if since:
+            parts += ["--since", since]
+            parts += ["-n", str(lines)]
+        else:
+            parts += ["-n", str(lines)]
+        cmd = " ".join(parts)
+        return _local_or_ssh_cmd(dev, cmd, timeout=15)
+
+    try:
+        raw = await asyncio.to_thread(_fetch)
+    except Exception:
+        raw = None
+
+    if raw is None:
+        return JSONResponse({"error": "Device unreachable"}, status_code=502)
+
+    result_lines = [l for l in raw.splitlines() if l.strip()]
+    last_ts = ""
+    if result_lines:
+        # short-iso format: "2026-02-28T10:15:30-0800 hostname ..."
+        first_token = result_lines[-1].split(" ", 1)[0]
+        if "T" in first_token:
+            last_ts = first_token
+
+    return {"device_id": device_id, "lines": result_lines, "last_timestamp": last_ts, "count": len(result_lines)}
+
+
+@app.get("/api/logs/{device_id}/services")
+async def get_log_services(device_id: str):
+    dev = _find_device(device_id)
+    if not dev:
+        return JSONResponse({"error": "Unknown device"}, status_code=404)
+    if not dev.get("ip"):
+        return JSONResponse({"error": "Device has no IP"}, status_code=400)
+
+    def _fetch():
+        cmd = "systemctl list-units --type=service --state=running --no-pager --plain --no-legend"
+        raw = _local_or_ssh_cmd(dev, cmd, timeout=10)
+        if not raw:
+            return []
+        services = []
+        for line in raw.strip().splitlines():
+            parts = line.split()
+            if parts:
+                name = parts[0]
+                # Strip .service suffix for display
+                if name.endswith(".service"):
+                    name = name[:-8]
+                services.append(name)
+        return sorted(services)
+
+    cache_key = f"log_services_{device_id}"
+    try:
+        services = await asyncio.to_thread(lambda: cached(cache_key, _fetch, ttl=60))
+    except Exception:
+        return JSONResponse({"error": "Device unreachable"}, status_code=502)
+
+    return {"device_id": device_id, "services": services}
+
+
 @app.get("/VERSION", response_class=PlainTextResponse)
 async def version_file():
     return APP_VERSION
@@ -1477,6 +1584,59 @@ h1 span { color: #ff6b6b; font-weight: 400; }
     font-weight: 400;
 }
 .net-today-badge .val { font-weight: 700; color: #e0e0e0; }
+
+/* Log viewer */
+.log-overlay {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.6); z-index: 9000;
+    display: none; opacity: 0; transition: opacity 0.2s;
+}
+.log-overlay.open { display: block; opacity: 1; }
+.log-panel {
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: min(70%, 900px); background: #0a0a1a;
+    border-left: 1px solid #222; z-index: 9001;
+    display: flex; flex-direction: column;
+    transform: translateX(100%); transition: transform 0.25s ease;
+}
+.log-overlay.open .log-panel { transform: translateX(0); }
+.log-toolbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px; background: #111128;
+    border-bottom: 1px solid #222; flex-shrink: 0;
+}
+.log-toolbar .log-title {
+    font-weight: 700; font-size: 0.95em; margin-right: auto;
+}
+.log-toolbar select, .log-toolbar button {
+    background: #1a1a3a; color: #ccc; border: 1px solid #333;
+    border-radius: 4px; padding: 4px 8px; font-size: 0.8em;
+    cursor: pointer;
+}
+.log-toolbar select:hover, .log-toolbar button:hover { border-color: #555; }
+.log-toolbar button.active { background: #2a2a5a; color: #fff; }
+.log-body {
+    flex: 1; overflow-y: auto; padding: 10px 14px;
+    font-family: 'SF Mono', Consolas, 'Courier New', monospace;
+    font-size: 0.78em; line-height: 1.5; color: #b0b0b0;
+    white-space: pre-wrap; word-break: break-all;
+}
+.log-body .log-line { padding: 1px 0; }
+.log-body .log-line:hover { background: rgba(255,255,255,0.03); }
+.log-status {
+    padding: 6px 14px; background: #111128;
+    border-top: 1px solid #222; font-size: 0.75em;
+    color: #555; flex-shrink: 0;
+    display: flex; justify-content: space-between;
+}
+.log-btn-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; border-radius: 4px;
+    background: transparent; border: 1px solid transparent;
+    color: #555; cursor: pointer; font-size: 0.85em;
+    transition: all 0.15s; margin-left: auto;
+}
+.log-btn-icon:hover { background: rgba(255,255,255,0.08); color: #aaa; border-color: #333; }
 </style>
 </head>
 <body>
@@ -1492,6 +1652,31 @@ h1 span { color: #ff6b6b; font-weight: 400; }
 <div id="fleet-grid"></div>
 <div id="network-section"></div>
 <div id="api-section"></div>
+
+<!-- Log viewer panel -->
+<div class="log-overlay" id="log-overlay" onclick="if(event.target===this)closeLogViewer()">
+    <div class="log-panel">
+        <div class="log-toolbar">
+            <span class="log-title" id="log-title">Logs</span>
+            <select id="log-service" onchange="onLogServiceChange()">
+                <option value="">All services</option>
+            </select>
+            <select id="log-lines" onchange="onLogLinesChange()">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+            </select>
+            <button id="log-pause-btn" onclick="toggleLogPause()">Pause</button>
+            <button onclick="closeLogViewer()">Close</button>
+        </div>
+        <div class="log-body" id="log-body"></div>
+        <div class="log-status">
+            <span id="log-status-left">Ready</span>
+            <span id="log-status-right"></span>
+        </div>
+    </div>
+</div>
 
 <script>
 let charts = {};
@@ -1634,10 +1819,13 @@ function renderDeviceCard(dev) {
         servicesHtml = `<div class="dev-services">${pills.join('')}</div>`;
     }
 
+    const logBtn = dev.ip ? `<span class="log-btn-icon" title="View logs" onclick="openLogViewer('${dev.id}','${dev.alias||dev.label}','${dev.color}')">&#9776;</span>` : '';
+
     return `<div class="dev-card">
         <div class="dev-header">
             <span class="online-dot on"></span>
             <span class="dev-alias" style="color:${dev.color}">${dev.alias || dev.label}</span>
+            ${logBtn}
         </div>
         <div class="dev-type">${subtitle}</div>
 
@@ -2185,6 +2373,150 @@ function toggleNetworkSection() {
     _networkSectionCollapsed = !_networkSectionCollapsed;
     if (_lastNetworkData) renderNetworkSection(_lastNetworkData);
 }
+
+// -----------------------------------------------------------------------
+// Log viewer
+// -----------------------------------------------------------------------
+
+let _logDeviceId = null;
+let _logAlias = '';
+let _logColor = '';
+let _logInterval = null;
+let _logPaused = false;
+let _logLastTs = '';
+let _logAutoScroll = true;
+
+function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function openLogViewer(deviceId, alias, color) {
+    _logDeviceId = deviceId;
+    _logAlias = alias;
+    _logColor = color;
+    _logPaused = false;
+    _logLastTs = '';
+    _logAutoScroll = true;
+
+    document.getElementById('log-title').innerHTML = `<span style="color:${color}">${alias}</span> logs`;
+    document.getElementById('log-body').innerHTML = '';
+    document.getElementById('log-pause-btn').textContent = 'Pause';
+    document.getElementById('log-pause-btn').classList.remove('active');
+    document.getElementById('log-status-left').textContent = 'Connecting...';
+    document.getElementById('log-status-right').textContent = '';
+    document.getElementById('log-service').innerHTML = '<option value="">All services</option>';
+
+    const overlay = document.getElementById('log-overlay');
+    overlay.classList.add('open');
+
+    fetchLogServices(deviceId);
+    fetchLogs(true);
+
+    if (_logInterval) clearInterval(_logInterval);
+    _logInterval = setInterval(() => {
+        if (!_logPaused) fetchLogs(false);
+    }, 3000);
+
+    // Auto-scroll detection
+    const body = document.getElementById('log-body');
+    body.onscroll = () => {
+        const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+        _logAutoScroll = atBottom;
+    };
+}
+
+function closeLogViewer() {
+    document.getElementById('log-overlay').classList.remove('open');
+    if (_logInterval) { clearInterval(_logInterval); _logInterval = null; }
+    _logDeviceId = null;
+}
+
+async function fetchLogs(isInitial) {
+    if (!_logDeviceId) return;
+    const service = document.getElementById('log-service').value;
+    const lines = document.getElementById('log-lines').value;
+    let url = `/api/logs/${_logDeviceId}?lines=${lines}`;
+    if (service) url += `&service=${encodeURIComponent(service)}`;
+    if (!isInitial && _logLastTs) url += `&since=${encodeURIComponent(_logLastTs)}`;
+
+    try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            document.getElementById('log-status-left').textContent = err.error || 'Error';
+            return;
+        }
+        const data = await resp.json();
+        const body = document.getElementById('log-body');
+
+        if (isInitial) {
+            body.innerHTML = data.lines.map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('');
+        } else {
+            // Append new lines (skip first if it overlaps with last)
+            let newLines = data.lines;
+            if (newLines.length === 0) {
+                document.getElementById('log-status-left').textContent = `${body.children.length} lines · live`;
+                return;
+            }
+            const html = newLines.map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('');
+            body.insertAdjacentHTML('beforeend', html);
+        }
+
+        // Trim to 2000 lines
+        while (body.children.length > 2000) body.removeChild(body.firstChild);
+
+        if (data.last_timestamp) _logLastTs = data.last_timestamp;
+        document.getElementById('log-status-left').textContent = `${body.children.length} lines · live`;
+        document.getElementById('log-status-right').textContent = new Date().toLocaleTimeString();
+
+        if (_logAutoScroll) body.scrollTop = body.scrollHeight;
+    } catch (e) {
+        document.getElementById('log-status-left').textContent = 'Fetch error';
+    }
+}
+
+async function fetchLogServices(deviceId) {
+    try {
+        const resp = await fetch(`/api/logs/${deviceId}/services`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const sel = document.getElementById('log-service');
+        for (const svc of data.services) {
+            const opt = document.createElement('option');
+            opt.value = svc;
+            opt.textContent = svc;
+            sel.appendChild(opt);
+        }
+    } catch (e) {}
+}
+
+function toggleLogPause() {
+    _logPaused = !_logPaused;
+    const btn = document.getElementById('log-pause-btn');
+    btn.textContent = _logPaused ? 'Resume' : 'Pause';
+    btn.classList.toggle('active', _logPaused);
+    const status = document.getElementById('log-status-left');
+    if (_logPaused) {
+        status.textContent = status.textContent.replace('· live', '· paused');
+    } else {
+        status.textContent = status.textContent.replace('· paused', '· live');
+    }
+}
+
+function onLogServiceChange() {
+    _logLastTs = '';
+    fetchLogs(true);
+}
+
+function onLogLinesChange() {
+    _logLastTs = '';
+    fetchLogs(true);
+}
+
+// Close on Escape key
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && _logDeviceId) closeLogViewer();
+});
 
 // -----------------------------------------------------------------------
 // Refresh loops
