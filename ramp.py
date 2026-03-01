@@ -64,11 +64,11 @@ DEFAULT_PORT = 8097
 STATS_DB_PATH = Path("/ssd/ramp/stats.db")
 
 KNOWN_DEVICES = [
-    {"id": "jetson-orin-nano",      "label": "Jetson Orin Nano",      "color": "#7c8aff",  "type": "jetson",      "alias": "Prometheus",   "ip": "192.168.0.18",  "user": "prometheus",  "password": "rising"},
-    {"id": "nvidia-dgx-spark",     "label": "NVIDIA DGX Spark",       "color": "#60a5fa",  "type": "dgx",         "alias": "Spark",        "ip": "192.168.0.234", "user": "macro",       "password": ""},
+    {"id": "jetson-orin-nano",      "label": "Jetson Orin Nano",      "color": "#7c8aff",  "type": "jetson",      "alias": "Prometheus",   "ip": "192.168.0.18",  "user": "prometheus",  "password": "rising",     "ollama_port": 11434},
+    {"id": "nvidia-dgx-spark",     "label": "NVIDIA DGX Spark",       "color": "#60a5fa",  "type": "dgx",         "alias": "Spark",        "ip": "192.168.0.234", "user": "macro",       "password": "",           "ollama_port": 11434, "ollama_public": "https://llama.digitalsurfacelabs.com", "llamacpp_port": 8081},
     {"id": "rtx4080-workstation",   "label": "RTX 4080 Workstation",   "color": "#a78bfa",  "type": "workstation", "alias": "Workstation"},
-    {"id": "atlas",                 "label": "Jetson Orin Nano Super", "color": "#34d399",  "type": "jetson",      "alias": "Atlas",        "ip": "192.168.0.101",  "user": "atlas",       "password": "shrugged",   "legacy_ids": ["orin-2", "orin-nano-2"]},
-    {"id": "epimetheus",            "label": "Jetson Orin Nano Super", "color": "#fbbf24",  "type": "jetson",      "alias": "Epimetheus",   "ip": "192.168.0.202", "user": "epimetheus",  "password": "reflecting", "legacy_ids": ["orin-3", "orin-nano-3"]},
+    {"id": "atlas",                 "label": "Jetson Orin Nano Super", "color": "#34d399",  "type": "jetson",      "alias": "Atlas",        "ip": "192.168.0.101",  "user": "atlas",       "password": "shrugged",   "legacy_ids": ["orin-2", "orin-nano-2"], "ollama_port": 11434},
+    {"id": "epimetheus",            "label": "Jetson Orin Nano Super", "color": "#fbbf24",  "type": "jetson",      "alias": "Epimetheus",   "ip": "192.168.0.202", "user": "epimetheus",  "password": "reflecting", "legacy_ids": ["orin-3", "orin-nano-3"], "ollama_port": 11434, "ollama_public": "https://gemma.digitalsurfacelabs.com"},
 ]
 
 APP_VERSION = Path("VERSION").read_text().strip() if Path("VERSION").exists() else "dev"
@@ -639,6 +639,119 @@ def fetch_compute_stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Ollama model discovery
+# ---------------------------------------------------------------------------
+
+def fetch_ollama_models() -> dict:
+    """Query each device for available Ollama and llama.cpp models."""
+    def _fetch():
+        results = []
+        for dev in KNOWN_DEVICES:
+            ollama_port = dev.get("ollama_port")
+            llamacpp_port = dev.get("llamacpp_port")
+            if not ollama_port and not llamacpp_port:
+                continue
+
+            ip = dev.get("ip", "")
+            models = []
+
+            # --- Ollama models ---
+            if ollama_port:
+                raw = _local_or_ssh_cmd(
+                    dev,
+                    f"curl -s --connect-timeout 3 http://localhost:{ollama_port}/api/tags",
+                    timeout=10,
+                )
+                if raw:
+                    try:
+                        data = json.loads(raw.strip())
+                        for m in data.get("models", []):
+                            details = m.get("details", {})
+                            models.append({
+                                "name": m.get("name", ""),
+                                "size_bytes": m.get("size", 0),
+                                "parameter_size": details.get("parameter_size", ""),
+                                "quantization": details.get("quantization_level", ""),
+                                "family": details.get("family", ""),
+                                "modified_at": m.get("modified_at", ""),
+                                "backend": "ollama",
+                                "port": ollama_port,
+                            })
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+            # --- llama.cpp models ---
+            if llamacpp_port:
+                raw = _local_or_ssh_cmd(
+                    dev,
+                    f"curl -s --connect-timeout 3 http://localhost:{llamacpp_port}/props",
+                    timeout=10,
+                )
+                if raw:
+                    try:
+                        props = json.loads(raw.strip())
+                        alias = props.get("model_alias", "")
+                        model_path = props.get("model_path", "")
+                        n_ctx = props.get("default_generation_settings", {}).get("n_ctx", 0)
+                        slots = props.get("total_slots", 0)
+                        modalities = props.get("modalities", {})
+                        # Extract model name from alias or path
+                        name = alias.split("/")[-1] if "/" in alias else alias
+                        if name.endswith(".gguf"):
+                            name = name.rsplit(".gguf", 1)[0]
+                        # Try to extract parameter size from name
+                        param_size = ""
+                        for part in name.lower().replace("-", " ").split():
+                            if part.endswith("b") and part[:-1].replace(".", "").isdigit():
+                                param_size = part.upper()
+                                break
+                        # Extract quantization from name
+                        quant = ""
+                        for q in ["mxfp4", "q4_0", "q4_k_m", "q5_k_m", "q8_0", "fp16", "f16"]:
+                            if q in name.lower():
+                                quant = q.upper()
+                                break
+                        models.append({
+                            "name": name,
+                            "size_bytes": 0,
+                            "parameter_size": param_size,
+                            "quantization": quant,
+                            "family": "",
+                            "modified_at": "",
+                            "backend": "llamacpp",
+                            "port": llamacpp_port,
+                            "n_ctx": n_ctx,
+                            "slots": slots,
+                            "vision": modalities.get("vision", False),
+                            "tool_use": props.get("chat_template_caps", {}).get("supports_tool_calls", False),
+                        })
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+            # Build endpoint info
+            ollama_local = f"http://{ip}:{ollama_port}" if ip and ollama_port else ""
+            llamacpp_local = f"http://{ip}:{llamacpp_port}" if ip and llamacpp_port else ""
+            public_url = dev.get("ollama_public", "")
+
+            results.append({
+                "device_id": dev["id"],
+                "alias": dev["alias"],
+                "color": dev["color"],
+                "ip": ip,
+                "ollama_port": ollama_port,
+                "llamacpp_port": llamacpp_port,
+                "ollama_local": ollama_local,
+                "llamacpp_local": llamacpp_local,
+                "public_url": public_url,
+                "models": models,
+                "online": len(models) > 0,
+            })
+        return {"devices": results}
+
+    return cached("ollama_models", _fetch, ttl=60)
+
+
+# ---------------------------------------------------------------------------
 # Network stats
 # ---------------------------------------------------------------------------
 
@@ -874,6 +987,12 @@ async def api_data():
 async def api_compute():
     """Compute fleet stats — latest metrics + 24h history per device."""
     return JSONResponse(fetch_compute_stats())
+
+
+@app.get("/api/models")
+async def api_models():
+    """Ollama models available across the fleet."""
+    return JSONResponse(fetch_ollama_models())
 
 
 def _ensure_ingest_tables(conn):
@@ -1360,6 +1479,109 @@ h1 span { color: #ff6b6b; font-weight: 400; }
     background: currentColor;
 }
 
+/* Models section */
+.models-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 14px;
+    margin-bottom: 8px;
+}
+.model-card {
+    background: linear-gradient(135deg, #0e0e22 0%, #141430 100%);
+    border: 1px solid #2a2a4a;
+    border-radius: 10px;
+    padding: 16px 18px;
+}
+.model-card .model-device {
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: #888;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.model-card .model-device .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+.model-entry {
+    background: rgba(0,0,0,0.3);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+}
+.model-entry:last-child { margin-bottom: 0; }
+.model-name {
+    font-size: 0.95em;
+    font-weight: 700;
+    color: #e0e0e0;
+    margin-bottom: 4px;
+}
+.model-meta {
+    display: flex;
+    gap: 10px;
+    font-size: 0.7em;
+    color: #666;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+}
+.model-meta span { white-space: nowrap; }
+.model-endpoints {
+    font-size: 0.68em;
+    color: #555;
+    margin-bottom: 6px;
+}
+.model-endpoints a {
+    color: #7c8aff;
+    text-decoration: none;
+}
+.model-endpoints a:hover { text-decoration: underline; }
+.model-curl {
+    position: relative;
+    background: rgba(0,0,0,0.5);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-size: 0.65em;
+    color: #888;
+    overflow-x: auto;
+    white-space: pre;
+    line-height: 1.5;
+    margin-top: 6px;
+}
+.model-curl-label {
+    font-size: 0.65em;
+    color: #5c6bc0;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 600;
+    margin-top: 8px;
+    margin-bottom: 3px;
+}
+.model-curl .copy-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: rgba(124,138,255,0.15);
+    border: 1px solid rgba(124,138,255,0.3);
+    border-radius: 3px;
+    color: #7c8aff;
+    cursor: pointer;
+    padding: 2px 6px;
+    font-size: 0.9em;
+    font-family: inherit;
+}
+.model-curl .copy-btn:hover { background: rgba(124,138,255,0.3); }
+.model-no-models {
+    color: #444;
+    font-size: 0.8em;
+    text-align: center;
+    padding: 12px;
+}
+
 /* Collapsible sections */
 .collapsible-header {
     display: flex;
@@ -1650,6 +1872,7 @@ h1 span { color: #ff6b6b; font-weight: 400; }
 
 <div id="fleet-summary"></div>
 <div id="fleet-grid"></div>
+<div id="models-section"></div>
 <div id="network-section"></div>
 <div id="api-section"></div>
 
@@ -2023,6 +2246,152 @@ function renderComputeFleet(computeData, apiData) {
             }
         });
     });
+}
+
+// -----------------------------------------------------------------------
+// Models section (collapsible)
+// -----------------------------------------------------------------------
+
+let _lastModelsData = null;
+let _modelsSectionCollapsed = false;
+
+function fmtModelSize(bytes) {
+    if (!bytes) return '\u2014';
+    const gb = bytes / (1024 * 1024 * 1024);
+    return gb >= 1 ? gb.toFixed(1) + ' GB' : (gb * 1024).toFixed(0) + ' MB';
+}
+
+function copyToClipboard(text, btn) {
+    navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.textContent;
+        btn.textContent = '\u2713';
+        setTimeout(() => btn.textContent = orig, 1200);
+    });
+}
+
+function renderModelCard(devModels) {
+    const alias = devModels.alias;
+    const color = devModels.color;
+    const models = devModels.models || [];
+    const ollamaLocal = devModels.ollama_local || '';
+    const llamacppLocal = devModels.llamacpp_local || '';
+    const publicUrl = devModels.public_url || '';
+
+    if (!models.length) {
+        return `<div class="model-card">
+            <div class="model-device"><span class="dot" style="background:${color}"></span>${alias}</div>
+            <div class="model-no-models">No models loaded</div>
+        </div>`;
+    }
+
+    const modelsHtml = models.map(m => {
+        const isLlamaCpp = m.backend === 'llamacpp';
+        const localUrl = isLlamaCpp ? llamacppLocal : ollamaLocal;
+        const baseUrl = (!isLlamaCpp && publicUrl) ? publicUrl : localUrl;
+
+        let chatCurl, genCurl;
+        if (isLlamaCpp) {
+            // OpenAI-compatible API
+            chatCurl = `curl ${baseUrl}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{
+  "model": "${m.name}",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "max_tokens": 256
+}'`;
+            genCurl = `curl ${baseUrl}/v1/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{
+  "model": "${m.name}",
+  "prompt": "Hello",
+  "max_tokens": 256
+}'`;
+        } else {
+            // Ollama API
+            chatCurl = `curl ${baseUrl}/api/chat -d '{
+  "model": "${m.name}",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "stream": false
+}'`;
+            genCurl = `curl ${baseUrl}/api/generate -d '{
+  "model": "${m.name}",
+  "prompt": "Hello",
+  "stream": false
+}'`;
+        }
+
+        let endpointHtml = '';
+        if (!isLlamaCpp && publicUrl) {
+            endpointHtml += `<div class="model-endpoints">\u2601 Public: <a href="${publicUrl}" target="_blank">${publicUrl}</a></div>`;
+        }
+        if (localUrl) {
+            endpointHtml += `<div class="model-endpoints">\u2302 LAN: ${localUrl}</div>`;
+        }
+
+        // Backend badge
+        const backendBadge = isLlamaCpp
+            ? '<span style="background:rgba(248,113,113,0.15);color:#f87171;padding:1px 6px;border-radius:3px;font-size:0.85em">llama.cpp</span>'
+            : '<span style="background:rgba(74,222,128,0.15);color:#4ade80;padding:1px 6px;border-radius:3px;font-size:0.85em">ollama</span>';
+
+        // Extra info for llama.cpp
+        let extraMeta = '';
+        if (isLlamaCpp) {
+            const parts = [];
+            if (m.n_ctx) parts.push(`${(m.n_ctx/1024).toFixed(0)}K ctx`);
+            if (m.slots) parts.push(`${m.slots} slots`);
+            if (m.vision) parts.push('vision');
+            if (m.tool_use) parts.push('tools');
+            extraMeta = parts.map(p => `<span>${p}</span>`).join('');
+        }
+
+        return `<div class="model-entry">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                <div class="model-name" style="margin-bottom:0">${m.name}</div>
+                ${backendBadge}
+            </div>
+            <div class="model-meta">
+                <span>${m.parameter_size || '\u2014'}</span>
+                <span>${m.quantization || ''}</span>
+                <span>${m.family || ''}</span>
+                ${m.size_bytes ? `<span>${fmtModelSize(m.size_bytes)}</span>` : ''}
+                ${extraMeta}
+            </div>
+            ${endpointHtml}
+            <div class="model-curl-label">Chat${isLlamaCpp ? ' (OpenAI-compatible)' : ''}</div>
+            <div class="model-curl"><button class="copy-btn" onclick="copyToClipboard(this.parentElement.querySelector('code').textContent, this)">Copy</button><code>${chatCurl}</code></div>
+            <div class="model-curl-label">${isLlamaCpp ? 'Completions' : 'Generate'}</div>
+            <div class="model-curl"><button class="copy-btn" onclick="copyToClipboard(this.parentElement.querySelector('code').textContent, this)">Copy</button><code>${genCurl}</code></div>
+        </div>`;
+    }).join('');
+
+    return `<div class="model-card">
+        <div class="model-device"><span class="dot" style="background:${color}"></span>${alias}</div>
+        ${modelsHtml}
+    </div>`;
+}
+
+function renderModelsSection(data) {
+    const el = document.getElementById('models-section');
+    if (!data || !data.devices) { el.innerHTML = ''; return; }
+
+    const devicesWithOllama = data.devices;
+    const totalModels = devicesWithOllama.reduce((s, d) => s + (d.models?.length || 0), 0);
+    const onlineCount = devicesWithOllama.filter(d => d.online).length;
+
+    const collClass = _modelsSectionCollapsed ? 'collapsed' : '';
+    const bodyClass = _modelsSectionCollapsed ? 'hidden' : '';
+
+    const cards = devicesWithOllama.map(d => renderModelCard(d)).join('');
+
+    el.innerHTML = `
+        <div class="collapsible-header ${collClass}" onclick="_modelsSectionCollapsed=!_modelsSectionCollapsed;renderModelsSection(_lastModelsData)">
+            <span class="arrow">\u25BC</span>
+            Models
+            <span style="font-size:0.7em;color:#666;font-weight:400;letter-spacing:0">${totalModels} model${totalModels !== 1 ? 's' : ''} on ${onlineCount} device${onlineCount !== 1 ? 's' : ''}</span>
+        </div>
+        <div class="collapsible-body ${bodyClass}" style="max-height:2000px">
+            <div class="models-grid">${cards}</div>
+        </div>`;
 }
 
 // -----------------------------------------------------------------------
@@ -2556,15 +2925,27 @@ async function fetchNetwork() {
     }
 }
 
+async function fetchModels() {
+    try {
+        const resp = await fetch('/api/models');
+        _lastModelsData = await resp.json();
+        renderModelsSection(_lastModelsData);
+    } catch (e) {
+        console.error('Models fetch error:', e);
+    }
+}
+
 // Initial load
 fetchCompute();
 fetchApi();
 fetchNetwork();
+fetchModels();
 
-// Compute fleet: 15s refresh, API data: 60s refresh, Network: 30s refresh
+// Compute fleet: 15s refresh, API data: 60s refresh, Network: 30s, Models: 60s
 setInterval(fetchCompute, 15000);
 setInterval(fetchApi, 60000);
 setInterval(fetchNetwork, 30000);
+setInterval(fetchModels, 60000);
 </script>
 <div id="dsl-version" style="position:fixed;bottom:8px;right:8px;font-family:'SF Mono',Consolas,monospace;font-size:11px;color:rgba(255,255,255,0.35);background:rgba(0,0,0,0.25);padding:2px 8px;border-radius:4px;pointer-events:none;z-index:9998;letter-spacing:0.5px">__VERSION__</div>
 </body>
